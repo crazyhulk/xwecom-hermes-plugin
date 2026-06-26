@@ -204,7 +204,8 @@ class XWeComAdapter(BasePlatformAdapter):
         """Clean shutdown."""
         if self._client:
             try:
-                await self._client.disconnect()
+                # SDK's disconnect() is synchronous — don't await it.
+                self._client.disconnect()
             except Exception as e:
                 logger.warning(f"xwecom: disconnect error - {e}")
             self._client = None
@@ -253,23 +254,34 @@ class XWeComAdapter(BasePlatformAdapter):
     # ── Inbound message handling ────────────────────────────────────────────
 
     async def _on_message(self, frame: Dict[str, Any]) -> None:
-        """Handle inbound user messages from WeCom."""
-        data = frame.get("data", {})
-        msg_id = data.get("msgid", "") or frame.get("req_id", "")
+        """Handle inbound user messages from WeCom.
+
+        SDK pushes a ``WsFrame`` dict — the actual message payload lives
+        in ``frame["body"]`` and follows the schema defined by the
+        official OpenClaw plugin (``src/message-parser.ts:MessageBody``):
+        ``msgid``, ``chattype`` ("single"|"group"), ``chatid``,
+        ``from.userid`` / ``from.corpid``, ``msgtype``, etc.
+        """
+        body = frame.get("body") or {}
+        headers = frame.get("headers") or {}
+        msg_id = body.get("msgid") or headers.get("req_id") or ""
 
         # Dedup
         if msg_id and self._dedup.is_duplicate(msg_id):
             logger.debug(f"xwecom: duplicate message {msg_id}, skipping")
             return
 
-        # Extract sender info
-        sender = data.get("sender", {})
+        # Extract sender / chat info — aligned with OpenClaw conventions:
+        # body.from.userid is the sender; chat_id falls back to userid for DMs.
+        sender = body.get("from") or {}
         user_id = sender.get("userid", "")
-        user_name = sender.get("name", user_id)
-        chat_id = data.get("chatid", "")
-
-        # Determine chat type
-        is_group = self._is_group_chat(chat_id)
+        user_name = sender.get("name") or user_id
+        chat_type_raw = (body.get("chattype") or "").lower()
+        is_group = chat_type_raw == "group"
+        chat_id = body.get("chatid") or sender.get("chat_id") or ""
+        if not chat_id and not is_group:
+            # For DMs WeCom may omit chatid — route by user_id
+            chat_id = user_id
 
         # Access control
         if is_group:
@@ -283,15 +295,12 @@ class XWeComAdapter(BasePlatformAdapter):
                 logger.debug(f"xwecom: group message rejected by policy: {chat_id}/{user_id}")
                 return
         else:
-            # For DM, chat_id might be the user_id itself
-            effective_chat = chat_id or user_id
             if not check_dm_policy(self._dm_policy, self._allow_from, user_id):
                 logger.debug(f"xwecom: DM rejected by policy: {user_id}")
                 return
-            chat_id = effective_chat
 
-        # Parse message content
-        text, images = self._parse_message_content(data)
+        # Parse message content (handles text / image / mixed / quote / event)
+        text, images = self._parse_message_content(body)
 
         # Download media attachments
         cached_images: List[str] = []
@@ -312,7 +321,7 @@ class XWeComAdapter(BasePlatformAdapter):
         # Build MessageEvent
         source = self.build_source(
             chat_id=chat_id,
-            chat_name=data.get("chat_name", chat_id),
+            chat_name=body.get("chat_name") or chat_id,
             chat_type="group" if is_group else "dm",
             user_id=user_id,
             user_name=user_name,
@@ -327,7 +336,8 @@ class XWeComAdapter(BasePlatformAdapter):
             message_type=msg_type,
             source=source,
             message_id=msg_id,
-            images=cached_images if cached_images else None,
+            media_urls=cached_images,
+            media_types=["image"] * len(cached_images),
         )
 
         # Store frame ref for potential stream reply
@@ -339,8 +349,9 @@ class XWeComAdapter(BasePlatformAdapter):
 
     async def _on_event(self, frame: Dict[str, Any]) -> None:
         """Handle WeCom events (enter_chat, etc.)."""
-        # Events don't require processing in the adapter layer
-        event_type = frame.get("data", {}).get("event_type", "unknown")
+        body = frame.get("body") or {}
+        event_obj = body.get("event") or {}
+        event_type = event_obj.get("eventtype", "unknown")
         logger.debug(f"xwecom: received event: {event_type}")
 
     # ── Message parsing ─────────────────────────────────────────────────────
@@ -507,11 +518,11 @@ async def _standalone_send(
         body = {"msgtype": "markdown", "markdown": {"content": message}}
         await client.send_message(chat_id, body)
 
-        await client.disconnect()
+        client.disconnect()
         return {"success": True, "message_id": f"cron_{int(time.time())}"}
     except Exception as e:
         try:
-            await client.disconnect()
+            client.disconnect()
         except Exception:
             pass
         return {"error": f"Standalone send failed: {e}"}
