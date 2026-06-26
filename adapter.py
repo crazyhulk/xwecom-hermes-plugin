@@ -51,8 +51,18 @@ try:
         download_and_decrypt,
         upload_media_chunked,
     )
+    from .message_parser import parse_message_content, parse_message_simple
+    from .monitor import (
+        BufferedBlockDispatcher,
+        SessionRecorder,
+        SessionRecord,
+        handle_disconnected_event,
+        handle_enter_chat_event,
+    )
     from .policy import check_dm_policy, check_group_policy
+    from .state_manager import get_state_manager
     from .stream import BlockChunker, BlockStreamManager, StreamExpiredError
+    from .template_card import TemplateCardCache
 except ImportError:
     from sdk import WSClient, WSClientOptions  # type: ignore[no-redef]
     from constants import (  # type: ignore[no-redef]
@@ -67,8 +77,18 @@ except ImportError:
         download_and_decrypt,
         upload_media_chunked,
     )
+    from message_parser import parse_message_content, parse_message_simple  # type: ignore[no-redef]
+    from monitor import (  # type: ignore[no-redef]
+        BufferedBlockDispatcher,
+        SessionRecorder,
+        SessionRecord,
+        handle_disconnected_event,
+        handle_enter_chat_event,
+    )
     from policy import check_dm_policy, check_group_policy  # type: ignore[no-redef]
+    from state_manager import get_state_manager  # type: ignore[no-redef]
     from stream import BlockChunker, BlockStreamManager, StreamExpiredError  # type: ignore[no-redef]
+    from template_card import TemplateCardCache  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -331,39 +351,31 @@ class XWeComAdapter(BasePlatformAdapter):
         """Parse message body into text and image references.
 
         Returns: (text, [{"url": ..., "aes_key": ..., "filename": ...}])
-        """
-        msgtype = data.get("msgtype", "text")
-        text = ""
-        images: List[Dict[str, str]] = []
 
-        if msgtype == "text":
-            text = data.get("text", {}).get("content", "")
-        elif msgtype == "image":
-            img = data.get("image", {})
-            images.append({
-                "url": img.get("url", ""),
-                "aes_key": img.get("aeskey", ""),
-                "filename": img.get("file_name", "image.png"),
-            })
-        elif msgtype == "mixed":
-            # Mixed messages contain text + images
-            items = data.get("mixed", {}).get("items", [])
-            text_parts = []
-            for item in items:
-                item_type = item.get("type", "")
-                if item_type == "text":
-                    text_parts.append(item.get("content", ""))
-                elif item_type == "image":
-                    images.append({
-                        "url": item.get("url", ""),
-                        "aes_key": item.get("aeskey", ""),
-                        "filename": item.get("file_name", "image.png"),
-                    })
-            text = "\n".join(text_parts)
-        elif msgtype == "file":
-            file_info = data.get("file", {})
+        Aligned with OpenClaw: src/message-parser.ts:parseMessageContent
+        Delegates the heavy lifting to ``message_parser.parse_message_content``
+        and adapts the rich result back to the tuple form expected by tests.
+        """
+        parsed = parse_message_content(data)
+        images: List[Dict[str, str]] = []
+        for url in parsed.image_urls:
+            images.append(
+                {
+                    "url": url,
+                    "aes_key": parsed.image_aes_keys.get(url, ""),
+                    "filename": "image.png",
+                }
+            )
+
+        msgtype = data.get("msgtype", "text")
+        text = parsed.text
+
+        # Friendly stub texts for file/voice when there's no extracted text —
+        # preserves the prior adapter contract used by tests / Hermes routing.
+        if msgtype == "file" and not text:
+            file_info = data.get("file") or {}
             text = f"[文件] {file_info.get('file_name', 'unknown')}"
-        elif msgtype == "voice":
+        elif msgtype == "voice" and not text:
             text = "[语音消息]"
 
         return text.strip(), images

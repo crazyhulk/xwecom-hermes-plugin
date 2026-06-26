@@ -152,3 +152,37 @@ class BlockStreamManager:
     def can_send_frame(self, session: StreamSession) -> bool:
         """Check if we can send another intermediate frame."""
         return session.frame_count < MAX_INTERMEDIATE_FRAMES
+
+
+# ── Re-exports from message_sender (so callers can `from stream import …`) ─
+
+try:
+    from .message_sender import (  # noqa: F401
+        NonBlockingStreamGate,
+        REPLY_SEND_TIMEOUT_S,
+        STREAM_LIFETIME_S,
+        StreamLifetimeWatcher,
+        StreamNotSubscribedError,
+        THINKING_MESSAGE,
+        classify_stream_error,
+        send_thinking_reply,
+        send_we_com_reply,
+        send_we_com_reply_non_blocking,
+    )
+except ImportError:  # pragma: no cover — flat-import fallback for tests
+    try:
+        from message_sender import (  # type: ignore[no-redef]  # noqa: F401
+            NonBlockingStreamGate,
+            REPLY_SEND_TIMEOUT_S,
+            STREAM_LIFETIME_S,
+            StreamLifetimeWatcher,
+            StreamNotSubscribedError,
+            THINKING_MESSAGE,
+            classify_stream_error,
+            send_thinking_reply,
+            send_we_com_reply,
+            send_we_com_reply_non_blocking,
+        )
+    except ImportError:
+        # message_sender not installed yet — top-level helpers unavailable.
+        pass
