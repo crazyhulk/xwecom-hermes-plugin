@@ -1,0 +1,40 @@
+name: xwecom-platform
+label: XWeCom (企业微信 · Official SDK)
+kind: platform
+version: 1.0.0
+description: >
+  WeCom (Enterprise WeChat) gateway adapter for Hermes Agent, powered by
+  the official wecom-aibot-python-sdk-async. Provides stable WebSocket
+  connectivity, streaming replies, and media handling via the official
+  protocol implementation maintained by the Tencent WeCom team.
+author: crazyhulk
+requires_env:
+  - name: XWECOM_BOT_ID
+    description: "WeCom Smart Robot bot ID"
+    prompt: "XWeCom bot ID"
+    password: false
+  - name: XWECOM_SECRET
+    description: "WeCom Smart Robot secret"
+    prompt: "XWeCom secret"
+    password: true
+optional_env:
+  - name: XWECOM_WEBSOCKET_URL
+    description: "WeCom WebSocket URL (default: wss://openws.work.weixin.qq.com)"
+    prompt: "WebSocket URL"
+    password: false
+  - name: XWECOM_HOME_CHANNEL
+    description: "Default chat ID for cron / notification delivery"
+    prompt: "Home channel chat ID"
+    password: false
+  - name: XWECOM_HOME_CHANNEL_NAME
+    description: "Display name for the home channel"
+    prompt: "Home channel name"
+    password: false
+  - name: XWECOM_ALLOWED_USERS
+    description: "Comma-separated WeCom user IDs allowed to talk to the bot"
+    prompt: "Allowed users (comma-separated, or * for all)"
+    password: false
+  - name: XWECOM_ALLOW_ALL_USERS
+    description: "Set to 'true' to allow all users (overrides ALLOWED_USERS)"
+    prompt: "Allow all users (true/false)"
+    password: false
