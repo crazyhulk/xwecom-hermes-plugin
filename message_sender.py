@@ -46,9 +46,9 @@ REPLY_SEND_TIMEOUT_S = 25.0
 # Aligned with OpenClaw: const.ts:STREAM_EXPIRED_ERRCODE rationale.
 STREAM_LIFETIME_S = 6 * 60.0  # 360s
 
-# Thinking-message placeholder (visible space avoids server hiding it).
-# Aligned with OpenClaw: const.ts:THINKING_MESSAGE
-THINKING_MESSAGE = "<think>\n思考中...\n</think>"
+# Thinking-message placeholder — triggers WeCom client's typing animation.
+# Aligned with OpenClaw: const.ts:THINKING_MESSAGE (empty <think> tag)
+THINKING_MESSAGE = "<think></think>"
 
 
 class StreamNotSubscribedError(RuntimeError):

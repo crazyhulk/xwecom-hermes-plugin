@@ -1,0 +1,274 @@
+"""Tests for xwecom native streaming support.
+
+Covers the ``send_stream_frame`` lifecycle that ``GatewayStreamConsumer``
+exercises: seed → intermediate (via :class:`BlockChunker`) → finalize, plus
+the failure modes (no req_id, expired stream, frame cap).
+"""
+
+import asyncio
+import os
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+# Match the existing test suite's import style — sibling modules are
+# imported by name; the conftest.py in this dir wires up the gateway
+# stubs ``adapter`` needs.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def _make_adapter():
+    """Build an XWeComAdapter without running ``BasePlatformAdapter.__init__``.
+
+    The Hermes runtime isn't here, so we bypass the base init and seed
+    the streaming fields the consumer would otherwise rely on.
+    """
+    from adapter import XWeComAdapter
+
+    with patch("adapter.BasePlatformAdapter.__init__", return_value=None):
+        adapter = XWeComAdapter.__new__(XWeComAdapter)
+    adapter._client = None
+    adapter._last_chat_req_ids = {}
+    adapter._last_chat_frames = {}
+    adapter._stream_turns = {}
+    adapter._stream_expired_chats = set()
+    return adapter
+
+
+def _bind_chat(adapter, chat_id="chat1", req_id="REQ1"):
+    frame = {"headers": {"req_id": req_id}, "body": {}}
+    adapter._last_chat_req_ids[chat_id] = req_id
+    adapter._last_chat_frames[chat_id] = frame
+    return frame
+
+
+class TestSupportsNativeStreaming:
+    """Class attribute + method probe used by ``GatewayStreamConsumer``."""
+
+    def test_class_attribute_is_true(self):
+        from adapter import XWeComAdapter
+        assert XWeComAdapter.SUPPORTS_NATIVE_STREAMING is True
+
+    def test_instance_method_returns_true(self):
+        adapter = _make_adapter()
+        assert adapter.supports_native_streaming() is True
+        assert adapter.supports_native_streaming(chat_type="group") is True
+        assert adapter.supports_native_streaming(chat_type="dm") is True
+
+
+class TestSendStreamFrameRejects:
+    """Guard rails: bad inputs / missing state must return False fast so
+    the consumer can fall back to :meth:`XWeComAdapter.send`.
+    """
+
+    async def test_missing_chat_id_returns_false(self):
+        adapter = _make_adapter()
+        ok = await adapter.send_stream_frame("hi", chat_id="")
+        assert ok is False
+
+    async def test_disconnected_returns_false(self):
+        adapter = _make_adapter()
+        adapter._client = None
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+        assert ok is False
+
+    async def test_no_cached_req_id_returns_false(self):
+        adapter = _make_adapter()
+        adapter._client = MagicMock()  # connected, but no inbound bound
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+        assert ok is False
+
+    async def test_finalize_without_open_turn_returns_false(self):
+        adapter = _make_adapter()
+        adapter._client = MagicMock()
+        _bind_chat(adapter)
+        ok = await adapter.send_stream_frame("done", chat_id="chat1", finalize=True)
+        # Nothing was ever opened — there's nothing to finalize.
+        assert ok is False
+
+
+class TestSeedFrame:
+    """First call (empty text) sends the WeCom thinking placeholder."""
+
+    async def test_seed_calls_reply_stream_with_thinking_message(self):
+        from message_sender import THINKING_MESSAGE
+
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        frame = _bind_chat(adapter)
+
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+        assert ok is True
+        assert client.reply_stream.await_count == 1
+        args = client.reply_stream.await_args.args
+        # Signature: (frame, stream_id, content, finish)
+        assert args[0] is frame
+        assert isinstance(args[1], str) and args[1].startswith("stream_")
+        assert args[2] == THINKING_MESSAGE
+        assert args[3] is False
+
+    async def test_seed_marks_turn_seeded(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")
+
+        assert len(adapter._stream_turns) == 1
+        turn = next(iter(adapter._stream_turns.values()))
+        assert turn.seeded is True
+        assert turn.finalized is False
+
+
+class TestIntermediateFrames:
+    """Chunker-gated cumulative-text emission."""
+
+    async def test_long_cumulative_emits_one_intermediate_frame(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        # Seed first — consumer always does this.
+        await adapter.send_stream_frame("", chat_id="chat1")
+        assert client.reply_stream.await_count == 1
+
+        # Now feed a chunk that crosses BLOCK_STREAM_MIN_CHARS *and*
+        # contains sentence terminators — the chunker should emit.
+        long_text = "这是一段足够长的文字。" * 30  # ~330 chars, sentence-aligned
+        ok = await adapter.send_stream_frame(long_text, chat_id="chat1")
+        assert ok is True
+        assert client.reply_stream.await_count == 2
+        args = client.reply_stream.await_args.args
+        assert args[3] is False  # finish=False
+        assert args[2] == long_text  # cumulative content
+
+    async def test_short_text_holds_until_idle_flush(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")
+        # A few chars — chunker should not emit.
+        ok = await adapter.send_stream_frame("hi", chat_id="chat1")
+        assert ok is True
+        # Only the seed frame so far.
+        assert client.reply_stream.await_count == 1
+
+
+class TestFinalize:
+    """The closing ``finish=True`` frame."""
+
+    async def test_finalize_sends_finish_true_and_clears_turn(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")  # seed
+
+        ok = await adapter.send_stream_frame(
+            "final cumulative text", chat_id="chat1", finalize=True,
+        )
+        assert ok is True
+        last = client.reply_stream.await_args.args
+        assert last[3] is True  # finish=True
+        # Turn cleaned up so the next inbound message starts fresh.
+        assert adapter._stream_turns == {}
+
+
+class TestFrameCap:
+    """Past ``MAX_INTERMEDIATE_FRAMES`` we silently drop intermediates
+    and let the finalize frame carry the rest."""
+
+    async def test_intermediate_dropped_after_cap(self):
+        from constants import MAX_INTERMEDIATE_FRAMES
+
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")  # seed
+
+        # Force the turn to the cap as if we already sent that many frames.
+        turn = next(iter(adapter._stream_turns.values()))
+        turn.frame_count = MAX_INTERMEDIATE_FRAMES
+
+        client.reply_stream.reset_mock()
+        client.reply_stream.return_value = {"errcode": 0}
+
+        long_text = "这是一段够长的文字。" * 60
+        ok = await adapter.send_stream_frame(long_text, chat_id="chat1")
+        assert ok is True  # consumer keeps going; we just don't ship
+        assert client.reply_stream.await_count == 0
+
+
+class TestStreamExpiredErrcode:
+    """WeCom returns 846608 when no update has happened for 6 minutes.
+    We mark the chat expired and refuse new turns until a fresh inbound
+    message arrives (handled in ``_on_message``)."""
+
+    async def test_expired_errcode_marks_chat_and_returns_false(self):
+        from constants import STREAM_EXPIRED_ERRCODE
+
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": STREAM_EXPIRED_ERRCODE})
+        adapter._client = client
+        _bind_chat(adapter)
+
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+        assert ok is False
+        assert "chat1" in adapter._stream_expired_chats
+
+    async def test_expired_chat_blocks_new_turn(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        adapter._stream_expired_chats.add("chat1")
+
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+        assert ok is False
+        # We never even tried to send.
+        assert client.reply_stream.await_count == 0
+
+
+class TestOnMessageBindsReqId:
+    """The streaming code depends on ``_on_message`` having cached the
+    most recent inbound req_id + frame.  Verify the binding happens."""
+
+    async def test_on_message_stores_chat_to_req_id(self):
+        adapter = _make_adapter()
+        # Patch out the rest of the pipeline so we can drive _on_message
+        # directly without a connected gateway / SDK.
+        adapter._dedup = MagicMock()
+        adapter._dedup.is_duplicate = MagicMock(return_value=False)
+        adapter._dm_policy = "open"
+        adapter._allow_from = []
+        adapter._client = MagicMock()
+        adapter.handle_message = AsyncMock()
+        adapter.build_source = MagicMock(return_value={})
+
+        frame = {
+            "headers": {"req_id": "REQ-XYZ"},
+            "body": {
+                "msgid": "M1",
+                "chattype": "single",
+                "from": {"userid": "alice"},
+                "msgtype": "text",
+                "text": {"content": "hello"},
+            },
+        }
+        await adapter._on_message(frame)
+
+        # DM falls back to user_id as chat_id.
+        assert adapter._last_chat_req_ids.get("alice") == "REQ-XYZ"
+        assert adapter._last_chat_frames.get("alice") is frame

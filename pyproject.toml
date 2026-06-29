@@ -16,5 +16,4 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-# Don't treat root dir as a package (avoids importing __init__.py which needs gateway)
-import_mode = "importlib"
+addopts = "--import-mode=importlib"
