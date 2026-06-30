@@ -50,6 +50,36 @@ xwecom:
 
 正确做法：移植时 **adapter 端读什么 key，config 模板就要给同名 key**。把 adapter 期望的 key 列在 README/plugin.yaml 里，让用户配置时有据可查。
 
+### 案例 1.3：`MessageType` 枚举成员
+
+错的写法：
+```python
+msg_type = MessageType.IMAGE   # ← Hermes 里没有这个成员
+```
+
+报错：`AttributeError: type object 'MessageType' has no attribute 'IMAGE'`，被外层捕获后只打 `xwecom: error - IMAGE`，看着像无意义字符串。
+
+Hermes 的实际成员（`gateway/platforms/base.py`）：
+```python
+class MessageType(Enum):
+    TEXT, LOCATION, PHOTO, VIDEO, AUDIO, VOICE, DOCUMENT, STICKER, COMMAND
+```
+
+注意：**图片是 `PHOTO`，不是 `IMAGE`**（命名跟 Telegram 的术语对齐，不跟 WeCom 的 `msgtype: "image"` 对齐）。
+
+### 案例 1.4：`cache_image_from_bytes` 第二个参数是扩展名
+
+错的写法：
+```python
+cache_image_from_bytes(img_data, "image.png")    # ← 把文件名当扩展名
+```
+
+正确：
+```python
+ext = os.path.splitext(filename)[1] or ".png"
+cache_image_from_bytes(img_data, ext)
+```
+
 ### 教训
 
 - 写 `MessageEvent(...)`、`PlatformConfig(...)`、`SendResult(...)` 这些 dataclass 之前，先 `grep "@dataclass" gateway/platforms/base.py` 或直接打开看一眼字段列表。

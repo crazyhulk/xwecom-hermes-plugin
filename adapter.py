@@ -357,6 +357,12 @@ class XWeComAdapter(BasePlatformAdapter):
         msg_id = body.get("msgid") or headers.get("req_id") or ""
         req_id = headers.get("req_id") or ""
 
+        # Trace non-text inbound so schema mismatches surface immediately.
+        msgtype = body.get("msgtype", "")
+        if msgtype and msgtype != "text":
+            logger.info("xwecom: inbound frame msgtype=%s body_keys=%s",
+                        msgtype, sorted(body.keys()))
+
         # Dedup
         if msg_id and self._dedup.is_duplicate(msg_id):
             logger.debug(f"xwecom: duplicate message {msg_id}, skipping")
@@ -409,21 +415,49 @@ class XWeComAdapter(BasePlatformAdapter):
         # Parse message content (handles text / image / mixed / quote / event)
         text, images = self._parse_message_content(body)
 
+        msgtype_log = body.get("msgtype", "?")
+        if images:
+            logger.info(
+                "xwecom: inbound media — msgtype=%s images=%d urls_present=%d aes_keys_present=%d",
+                msgtype_log,
+                len(images),
+                sum(1 for i in images if i.get("url")),
+                sum(1 for i in images if i.get("aes_key")),
+            )
+
         # Download media attachments
         cached_images: List[str] = []
-        for img_info in images:
-            img_data = await download_and_decrypt(
-                self._client, img_info.get("url", ""), img_info.get("aes_key")
-            )
-            if img_data and cache_image_from_bytes:
-                try:
-                    path = cache_image_from_bytes(
-                        img_data, img_info.get("filename", "image.png")
-                    )
-                    if path:
-                        cached_images.append(str(path))
-                except Exception as e:
-                    logger.warning(f"xwecom: failed to cache image: {e}")
+        for idx, img_info in enumerate(images):
+            url = img_info.get("url", "")
+            aes_key = img_info.get("aes_key") or img_info.get("aeskey") or ""
+            if not url:
+                logger.warning("xwecom: image %d has no url, skipping", idx)
+                continue
+            try:
+                img_data = await download_and_decrypt(self._client, url, aes_key)
+            except Exception as e:  # download_and_decrypt swallows but be safe
+                logger.warning("xwecom: image %d download exception: %s", idx, e)
+                img_data = None
+            if not img_data:
+                logger.warning(
+                    "xwecom: image %d download returned no data (url=%s aes_key_len=%d)",
+                    idx, url[:80], len(aes_key),
+                )
+                continue
+            if cache_image_from_bytes is None:
+                logger.warning("xwecom: cache_image_from_bytes unavailable in this Hermes build")
+                continue
+            # cache_image_from_bytes takes an EXTENSION (e.g. ".jpg"), not a filename.
+            fname = img_info.get("filename") or "image.png"
+            ext = os.path.splitext(fname)[1] or ".png"
+            try:
+                path = cache_image_from_bytes(img_data, ext)
+                if path:
+                    cached_images.append(str(path))
+                    logger.info("xwecom: cached image %d -> %s (%d bytes)",
+                                idx, path, len(img_data))
+            except Exception as e:
+                logger.warning("xwecom: failed to cache image %d: %s (%d bytes)", idx, e, len(img_data))
 
         # Build MessageEvent
         source = self.build_source(
@@ -436,7 +470,7 @@ class XWeComAdapter(BasePlatformAdapter):
 
         msg_type = MessageType.TEXT
         if cached_images and not text:
-            msg_type = MessageType.IMAGE
+            msg_type = MessageType.PHOTO
 
         event = MessageEvent(
             text=text or "",
@@ -728,12 +762,12 @@ class XWeComAdapter(BasePlatformAdapter):
             if finish:
                 # WeCom usually already rendered the content; the ack just
                 # didn't arrive in time.  Treat as success.
-                logger.debug(
+                logger.warning(
                     "xwecom: final-frame ack timeout for stream %s (treating as ok)",
                     turn.stream_id,
                 )
                 return True
-            logger.debug(
+            logger.warning(
                 "xwecom: intermediate-frame ack timeout for stream %s",
                 turn.stream_id,
             )
@@ -764,6 +798,10 @@ class XWeComAdapter(BasePlatformAdapter):
                 turn.stream_id, errcode, errmsg,
             )
             return False
+        logger.info(
+            "xwecom: stream %s frame sent (finish=%s, len=%d)",
+            turn.stream_id, finish, len(truncated),
+        )
         return True
 
     @staticmethod
