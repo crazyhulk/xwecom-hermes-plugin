@@ -233,7 +233,7 @@ class XWeComAdapter(BasePlatformAdapter):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
 
-    async def connect(self) -> bool:
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Establish WebSocket connection to WeCom."""
         if not self._bot_id or not self._secret:
             logger.error("xwecom: bot_id and secret are required")
