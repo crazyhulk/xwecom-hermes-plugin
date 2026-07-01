@@ -272,3 +272,87 @@ class TestOnMessageBindsReqId:
         # DM falls back to user_id as chat_id.
         assert adapter._last_chat_req_ids.get("alice") == "REQ-XYZ"
         assert adapter._last_chat_frames.get("alice") is frame
+
+
+# ── BlockChunker.drain (simplified API) ──────────────────────────────────────
+
+class TestBlockChunkerDrainAPI:
+    """Tests for the drain(cumulative_text) method used by the finalize path."""
+
+    def test_drain_returns_text_when_pending(self):
+        from stream import BlockChunker
+
+        c = BlockChunker()
+        result = c.drain("hello world")
+        assert result == "hello world"
+
+    def test_drain_returns_none_when_empty(self):
+        from stream import BlockChunker
+
+        c = BlockChunker()
+        assert c.drain("") is None
+
+    def test_drain_returns_none_after_already_emitted(self):
+        from stream import BlockChunker
+
+        c = BlockChunker()
+        c.mark_emitted("hello")
+        assert c.drain("hello") is None
+
+    def test_drain_returns_new_content_after_partial_emit(self):
+        from stream import BlockChunker
+
+        c = BlockChunker()
+        c.mark_emitted("first part")
+        result = c.drain("first part — and more")
+        assert result == "first part — and more"
+
+    def test_drain_advances_emitted_len(self):
+        from stream import BlockChunker
+
+        c = BlockChunker()
+        c.drain("first part")
+        assert c.emitted_length == len("first part")
+        # New content after drain
+        result = c.drain("first part — and more")
+        assert result == "first part — and more"
+        assert c.emitted_length == len("first part — and more")
+
+    def test_drain_returns_none_for_shorter_text(self):
+        from stream import BlockChunker
+
+        c = BlockChunker()
+        c.drain("long content here")
+        # Shorter text (anomaly) — should return None
+        assert c.drain("short") is None
+
+
+class TestFinalizeWithChunker:
+    """End-to-end: finalize path no longer crashes when chunker has pending content."""
+
+    @pytest.mark.asyncio
+    async def test_finalize_drains_chunker_pending(self):
+        """adapter.send_stream_frame(finalize=True) should not AttributeError."""
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+
+        # Seed
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+        assert ok is True
+
+        # Push an intermediate frame that creates the chunker
+        intermediate_text = "A" * 200  # above min_chars so it emits
+        ok = await adapter.send_stream_frame(
+            intermediate_text, chat_id="chat1"
+        )
+        assert ok is True
+
+        # Now finalize — this used to crash with AttributeError
+        full_text = intermediate_text + " — and the conclusion."
+        ok = await adapter.send_stream_frame(
+            full_text, finalize=True, chat_id="chat1"
+        )
+        assert ok is True

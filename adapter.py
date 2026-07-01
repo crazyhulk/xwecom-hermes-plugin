@@ -663,11 +663,9 @@ class XWeComAdapter(BasePlatformAdapter):
             self._cancel_idle_flush(turn)
             # Drain the chunker so the final frame carries the latest tail.
             if turn.chunker is not None:
-                turn.chunker.update(text)
-                if turn.chunker.has_pending():
-                    drained = turn.chunker.drain(force=True)
-                    if drained is not None:
-                        text = drained
+                drained = turn.chunker.drain(text)
+                if drained is not None:
+                    text = drained
 
             final_text = text or ""
             # WeCom silently drops a final frame whose content matches the
@@ -823,12 +821,21 @@ class XWeComAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _truncate_to_bytes(text: str, max_bytes: int) -> str:
+        """Keep the TAIL of the text within max_bytes (UTF-8).
+
+        Aligned with openclaw's truncateUtf8Bytes: in cumulative streaming,
+        the user should see the latest content, not the beginning.
+        """
         encoded = text.encode("utf-8")
         if len(encoded) <= max_bytes:
             return text
-        # Trim conservatively at a UTF-8 boundary.
-        cut = encoded[:max_bytes]
-        return cut.decode("utf-8", errors="ignore")
+        # Take the last max_bytes, then skip any leading continuation bytes
+        # (0b10xxxxxx) to land on a valid UTF-8 char boundary.
+        cut = encoded[len(encoded) - max_bytes:]
+        i = 0
+        while i < len(cut) and (cut[i] & 0xC0) == 0x80:
+            i += 1
+        return cut[i:].decode("utf-8", errors="ignore")
 
     def _cleanup_stream_turn(self, turn_key: str, turn: StreamTurn) -> None:
         self._cancel_idle_flush(turn)
@@ -851,18 +858,18 @@ class XWeComAdapter(BasePlatformAdapter):
         *,
         turn_id: Optional[str],
     ) -> None:
-        """Arm the 250ms idle-flush timer.
+        """Arm (or reset) the 250ms idle-flush timer.
 
         When the LLM pauses, the chunker's min_chars gate would hold a
         half-sentence forever. The official plugin's
         ``blockStreamingCoalesce.idleMs = 250`` solves this by force-draining
         the buffer after 250ms of silence.
 
-        The timer is per-turn and idempotent — re-arming while one is
-        pending no-ops.
+        Each call cancels any pending timer and re-arms, so the flush only
+        fires after a genuine 250ms of silence — aligned with openclaw's
+        debounce semantics.
         """
-        if turn.idle_flush_handle is not None:
-            return
+        self._cancel_idle_flush(turn)
         if turn.finalized or turn.expired:
             return
         try:

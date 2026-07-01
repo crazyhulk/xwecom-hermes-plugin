@@ -104,6 +104,17 @@ class BlockChunker:
         """Mark that we've emitted up to this point."""
         self._emitted_len = len(cumulative_text)
 
+    def drain(self, cumulative_text: str) -> Optional[str]:
+        """Return cumulative_text if there are un-emitted chars, else None.
+
+        Advances emitted_len to the end of cumulative_text. Used by the
+        adapter's finalize path to ensure no tail content is lost.
+        """
+        if not cumulative_text or len(cumulative_text) <= self._emitted_len:
+            return None
+        self._emitted_len = len(cumulative_text)
+        return cumulative_text
+
     @property
     def emitted_length(self) -> int:
         return self._emitted_len
