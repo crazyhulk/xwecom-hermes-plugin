@@ -267,7 +267,7 @@ class XWeComAdapter(BasePlatformAdapter):
             "disconnected",
             lambda reason="": logger.warning(f"xwecom: disconnected - {reason}"),
         )
-        self._client.on("error", lambda e: logger.error(f"xwecom: error - {e}"))
+        self._client.on("error", lambda e: logger.error(f"xwecom: error - {e}", exc_info=isinstance(e, BaseException)))
 
         try:
             await self._client.connect()
