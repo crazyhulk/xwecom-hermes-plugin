@@ -4,7 +4,7 @@ WeCom (企业微信) platform adapter for [Hermes Agent](https://hermes-agent.no
 
 ## Why
 
-The built-in Hermes WeCom adapter has 28+ open issues (WebSocket reconnection instability, message loss, media handling failures) that are deprioritized as p2/p3. This plugin replaces it with an implementation based on the official SDK maintained by the Tencent WeCom team.
+Heremes Agent 的 wecom 适配器实在是一言难尽。
 
 ## Installation
 
