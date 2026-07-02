@@ -380,6 +380,26 @@ class TestXWeComAdapterParsing:
         assert XWeComAdapter._coerce_list(["x", "y"]) == ["x", "y"]
         assert XWeComAdapter._coerce_list("single") == ["single"]
 
+    def test_interpret_scoped_lock_result_supports_legacy_bool(self):
+        from adapter import XWeComAdapter
+
+        assert XWeComAdapter._interpret_scoped_lock_result(True) == (True, None)
+        assert XWeComAdapter._interpret_scoped_lock_result(False) == (False, None)
+
+    def test_interpret_scoped_lock_result_supports_tuple_api(self):
+        from adapter import XWeComAdapter
+
+        existing = {"pid": 12345}
+
+        assert XWeComAdapter._interpret_scoped_lock_result((True, existing)) == (
+            True,
+            existing,
+        )
+        assert XWeComAdapter._interpret_scoped_lock_result((False, existing)) == (
+            False,
+            existing,
+        )
+
 
 # ── Integration-style tests ─────────────────────────────────────────────────
 

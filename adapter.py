@@ -414,6 +414,21 @@ class XWeComAdapter(BasePlatformAdapter):
             and app.get("encoding_aes_key")
         )
 
+    @staticmethod
+    def _interpret_scoped_lock_result(
+        result: Any,
+    ) -> Tuple[bool, Optional[Dict[str, Any]]]:
+        """Normalize Hermes scoped-lock return values across runtime versions."""
+        if isinstance(result, tuple):
+            acquired = bool(result[0]) if result else False
+            existing = (
+                result[1]
+                if len(result) > 1 and isinstance(result[1], dict)
+                else None
+            )
+            return acquired, existing
+        return bool(result), None
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Establish configured WeCom channels."""
         has_ws_credentials = bool(self._bot_id and self._secret)
@@ -428,8 +443,16 @@ class XWeComAdapter(BasePlatformAdapter):
 
         # Token lock — prevent two profiles from using same WS credential.
         if has_ws_credentials and acquire_scoped_lock is not None:
-            if not acquire_scoped_lock("xwecom", self._bot_id):
-                logger.error("xwecom: Token already in use by another profile")
+            lock_result = acquire_scoped_lock("xwecom", self._bot_id)
+            acquired, existing = self._interpret_scoped_lock_result(lock_result)
+            if not acquired:
+                owner_pid = existing.get("pid") if existing else None
+                owner_suffix = f" (PID {owner_pid})" if owner_pid else ""
+                logger.error(
+                    "xwecom: Token already in use by another profile%s. "
+                    "Stop the other gateway first.",
+                    owner_suffix,
+                )
                 return False
             self._lock_acquired = True
 
