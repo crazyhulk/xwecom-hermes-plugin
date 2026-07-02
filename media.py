@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import mimetypes
 import os
@@ -23,6 +24,8 @@ try:
         VOICE_MAX_BYTES,
         VOICE_SUPPORTED_MIMES,
     )
+    from .sdk.types import WsCmd
+    from .sdk.utils import generate_req_id
 except ImportError:
     from constants import (  # type: ignore[no-redef]
         ABSOLUTE_MAX_BYTES,
@@ -34,6 +37,8 @@ except ImportError:
         VOICE_MAX_BYTES,
         VOICE_SUPPORTED_MIMES,
     )
+    from sdk.types import WsCmd  # type: ignore[no-redef]
+    from sdk.utils import generate_req_id  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +371,7 @@ async def upload_media_chunked(
     """
     total_size = len(media_bytes)
     chunk_count = (total_size + UPLOAD_CHUNK_SIZE - 1) // UPLOAD_CHUNK_SIZE
+    md5 = hashlib.md5(media_bytes).hexdigest()
 
     if chunk_count > MAX_UPLOAD_CHUNKS:
         logger.error(f"Too many chunks ({chunk_count} > {MAX_UPLOAD_CHUNKS})")
@@ -379,17 +385,18 @@ async def upload_media_chunked(
     # Step 1: Init upload
     try:
         init_body = {
-            "media_type": media_type,
-            "file_name": filename,
-            "file_size": total_size,
-            "chunk_count": chunk_count,
+            "type": media_type,
+            "filename": filename,
+            "total_size": total_size,
+            "total_chunks": chunk_count,
+            "md5": md5,
         }
         init_resp = await ws_manager.send_reply(
-            f"upload_init_{os.urandom(4).hex()}",
+            generate_req_id(WsCmd.UPLOAD_MEDIA_INIT),
             init_body,
-            "aibot_upload_media_init",
+            WsCmd.UPLOAD_MEDIA_INIT,
         )
-        upload_id = (init_resp.get("data", {}) or {}).get("upload_id")
+        upload_id = _frame_payload(init_resp).get("upload_id")
         if not upload_id:
             logger.error(f"Upload init failed: {init_resp}")
             return None
@@ -407,12 +414,12 @@ async def upload_media_chunked(
             chunk_body = {
                 "upload_id": upload_id,
                 "chunk_index": i,
-                "chunk_data": chunk_b64,
+                "base64_data": chunk_b64,
             }
             await ws_manager.send_reply(
-                f"upload_chunk_{upload_id}_{i}",
+                generate_req_id(WsCmd.UPLOAD_MEDIA_CHUNK),
                 chunk_body,
-                "aibot_upload_media_chunk",
+                WsCmd.UPLOAD_MEDIA_CHUNK,
             )
         except Exception as e:
             logger.error(f"Upload chunk {i} error: {e}")
@@ -422,11 +429,11 @@ async def upload_media_chunked(
     try:
         finish_body = {"upload_id": upload_id}
         finish_resp = await ws_manager.send_reply(
-            f"upload_finish_{upload_id}",
+            generate_req_id(WsCmd.UPLOAD_MEDIA_FINISH),
             finish_body,
-            "aibot_upload_media_finish",
+            WsCmd.UPLOAD_MEDIA_FINISH,
         )
-        media_id = (finish_resp.get("data", {}) or {}).get("media_id")
+        media_id = _frame_payload(finish_resp).get("media_id")
         if not media_id:
             logger.error(f"Upload finish failed: {finish_resp}")
             return None
@@ -435,6 +442,17 @@ async def upload_media_chunked(
     except Exception as e:
         logger.error(f"Upload finish error: {e}")
         return None
+
+
+def _frame_payload(frame: Dict[str, Any]) -> Dict[str, Any]:
+    """Return SDK-style response payload, accepting older test/fork shapes too."""
+    body = frame.get("body")
+    if isinstance(body, dict):
+        return body
+    data = frame.get("data")
+    if isinstance(data, dict):
+        return data
+    return {}
 
 
 # ── Download helper ────────────────────────────────────────────────────────

@@ -1,6 +1,8 @@
 """Tests for media uploader — resolve_media_file, apply_file_size_limits, upload_and_send_media."""
 
 import asyncio
+import base64
+import hashlib
 import os
 import sys
 import tempfile
@@ -165,13 +167,13 @@ class _FakeWsManager:
     async def send_reply(self, req_id, body, cmd):
         self.calls.append({"req_id": req_id, "body": body, "cmd": cmd})
         if self.fail_at == cmd:
-            return {"data": {}}
+            return {"body": {}}
         if cmd == "aibot_upload_media_init":
-            return {"data": {"upload_id": "U1"}}
+            return {"body": {"upload_id": "U1"}}
         if cmd == "aibot_upload_media_chunk":
-            return {"data": {"ok": True}}
+            return {"body": {"ok": True}}
         if cmd == "aibot_upload_media_finish":
-            return {"data": {"media_id": "M-ABC"}}
+            return {"body": {"media_id": "M-ABC"}}
         return {}
 
 
@@ -206,6 +208,28 @@ class TestUploadAndSendMedia:
             assert client.sent[0][0] == "chat123"
             assert client.sent[0][1]["msgtype"] == "file"
             assert client.sent[0][1]["file"]["media_id"] == "M-ABC"
+            calls = client._ws_manager.calls
+            assert [call["cmd"] for call in calls] == [
+                "aibot_upload_media_init",
+                "aibot_upload_media_chunk",
+                "aibot_upload_media_finish",
+            ]
+            assert calls[0]["req_id"].startswith("aibot_upload_media_init_")
+            assert calls[0]["body"] == {
+                "type": "file",
+                "filename": os.path.basename(tmp_path),
+                "total_size": len(b"PDF-body"),
+                "total_chunks": 1,
+                "md5": hashlib.md5(b"PDF-body").hexdigest(),
+            }
+            assert calls[1]["req_id"].startswith("aibot_upload_media_chunk_")
+            assert calls[1]["body"] == {
+                "upload_id": "U1",
+                "chunk_index": 0,
+                "base64_data": base64.b64encode(b"PDF-body").decode("ascii"),
+            }
+            assert calls[2]["req_id"].startswith("aibot_upload_media_finish_")
+            assert calls[2]["body"] == {"upload_id": "U1"}
         finally:
             os.unlink(tmp_path)
 

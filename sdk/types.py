@@ -85,6 +85,15 @@ class WsCmd:
     SEND_MSG = "aibot_send_msg"
     """主动发送消息"""
 
+    UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
+    """上传临时素材 - 初始化"""
+
+    UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
+    """上传临时素材 - 分片上传"""
+
+    UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
+    """上传临时素材 - 完成上传"""
+
     # ========== 企业微信 → 开发者 ==========
     CALLBACK = "aibot_msg_callback"
     """消息推送回调"""
