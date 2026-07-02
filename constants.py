@@ -17,6 +17,11 @@ STREAM_EXPIRED_ERRCODE = 846608  # >6 min without update — stream is dead
 STREAM_NOT_SUBSCRIBED_ERRCODE = 846609  # ws lost subscription
 MAX_STREAM_CONTENT_LENGTH = 20480  # WeCom server-enforced byte limit per frame
 MAX_INTERMEDIATE_FRAMES = 85  # Cap at 85 (100 queue limit - room for finalize)
+STREAM_KEEPALIVE_INTERVAL_SECONDS = 4 * 60  # Aligned with openclaw-plugin-wecom
+STREAM_ROTATE_AFTER_SECONDS = 5 * 60  # Finish before WeCom's 6-minute hard limit
+TEXT_BATCH_DELAY_SECONDS = 0.6
+TEXT_BATCH_SPLIT_DELAY_SECONDS = 2.0
+TEXT_BATCH_SPLIT_THRESHOLD = 3900
 
 # Block streaming parameters (aligned with official wecom-openclaw-plugin)
 BLOCK_STREAM_MIN_CHARS = 120  # Don't emit a frame below this size

@@ -38,3 +38,39 @@ optional_env:
     description: "Set to 'true' to allow all users (overrides ALLOWED_USERS)"
     prompt: "Allow all users (true/false)"
     password: false
+  - name: XWECOM_CALLBACK_ENABLED
+    description: "Enable optional self-built app HTTP callback listener"
+    prompt: "Enable callback listener (true/false)"
+    password: false
+  - name: XWECOM_CALLBACK_HOST
+    description: "Callback listener bind host (default: 0.0.0.0)"
+    prompt: "Callback host"
+    password: false
+  - name: XWECOM_CALLBACK_PORT
+    description: "Callback listener port (default: 8645)"
+    prompt: "Callback port"
+    password: false
+  - name: XWECOM_CALLBACK_PATH
+    description: "Callback listener path (default: /wecom/callback)"
+    prompt: "Callback path"
+    password: false
+  - name: XWECOM_CORP_ID
+    description: "WeCom CorpID for self-built app callbacks"
+    prompt: "WeCom CorpID"
+    password: false
+  - name: XWECOM_CORP_SECRET
+    description: "WeCom CorpSecret for callback-mode proactive replies"
+    prompt: "WeCom CorpSecret"
+    password: true
+  - name: XWECOM_AGENT_ID
+    description: "WeCom self-built app AgentId for callback-mode proactive replies"
+    prompt: "WeCom AgentId"
+    password: false
+  - name: XWECOM_CALLBACK_TOKEN
+    description: "WeCom callback token"
+    prompt: "Callback token"
+    password: true
+  - name: XWECOM_ENCODING_AES_KEY
+    description: "WeCom callback EncodingAESKey"
+    prompt: "EncodingAESKey"
+    password: true

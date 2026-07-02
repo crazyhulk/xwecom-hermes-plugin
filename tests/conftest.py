@@ -49,10 +49,11 @@ class MockBasePlatformAdapter:
 
 
 class MockSendResult:
-    def __init__(self, success=False, message_id=None, error=None):
+    def __init__(self, success=False, message_id=None, error=None, raw_response=None):
         self.success = success
         self.message_id = message_id
         self.error = error
+        self.raw_response = raw_response
 
 
 class MockMessageEvent:

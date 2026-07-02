@@ -2,7 +2,7 @@
 
 ## 背景
 
-xwecom-hermes-plugin 的 BlockChunker 之前缺少 `update`/`has_pending`/`drain` 方法，导致 finalize 时 AttributeError crash，消息输出一半就断了。我们刚补了这三个方法让它不 crash，但需要确认整体设计是否对齐官方最佳实践。
+xwecom-hermes-plugin 的 BlockChunker 曾在 finalize 路径缺少可用的 drain API，导致消息输出一半就断。当前实现已经改成显式 `drain(cumulative_text)`，并补齐 idle flush、尾部截断、ACK pending 跳帧等对齐项。本报告保留差异分析，并标注当前仍未移植的能力。
 
 ---
 
@@ -64,16 +64,16 @@ xwecom-hermes-plugin 的 BlockChunker 之前缺少 `update`/`has_pending`/`drain
 - ✅ 参数对齐官方（min=120, max=360, idle=250ms, sentence break）
 - ✅ 有 idle flush 机制（250ms 强制刷出 partial buffer）
 - ✅ 有 frame cap 保护（85 帧上限）
-- ✅ 有 UTF-8 字节截断（20KB 限制）
+- ✅ 有 UTF-8 字节尾部截断（20KB 限制，对齐官方保留最新内容）
 - ✅ 有 stream expired 检测和回退
-- ✅ finalize 路径有 chunker.drain(force=True)
+- ✅ finalize 路径有 `chunker.drain(cumulative_text)`
+- ✅ 中间流帧有 ACK pending 跳帧，final 帧强制发送
+- ✅ 有 4 分钟 keepalive 和 5 分钟 stream rotation，主动避开企业微信 6 分钟硬限制
+- ✅ final 内容超过 20KB 时主动分块补发完整回复
 
-**缺点：**
-- ❌ BlockChunker 的 `_cumulative` 状态管理不够干净 — `update()`/`has_pending()`/`drain()` 是后补的紧急修复
-- ❌ 无防抖聚合（同会话连发消息各自独立 turn）
-- ❌ 无超时 6 分钟窗口主动检测 + 降级（只被动等 errcode 846608）
-- ❌ 无 dmContent 独立缓存（超长回复被截断后没有私信兜底通道）
-- ❌ idle flush 的 `_arm_idle_flush` 是幂等不重置的（首次 arm 后，如果 LLM 持续出 token 但不到 min_chars 阈值，不会重新计时）
+**差异：**
+- 没有原样照搬 OpenClaw 的 dmContent buffer；Hermes 版通过 AI Bot WS 主动补发完整内容。
+- 同会话纯文本防抖聚合已迁移为 adapter 内 session-scoped text batching；媒体消息不延迟。
 
 ---
 
@@ -112,19 +112,16 @@ startAgentForStream 结束时:
 send_stream_frame(finalize=True):
   1. _cancel_idle_flush(turn)
   2. if turn.chunker is not None:
-       turn.chunker.update(text)  // ← 后补的方法
-       if turn.chunker.has_pending():
-           drained = turn.chunker.drain(force=True)
-           if drained: text = drained
+       drained = turn.chunker.drain(text)
+       if drained is not None: text = drained
   3. 防重复：如果 final_text == turn.last_sent_content → 追加 ZWS
   4. _send_stream_reply_frame(turn, final_text, finish=True)
   5. turn.finalized = True; cleanup
 ```
 
 **问题分析：**
-- `update(text)` 把外部传入的 `text` 存入 `_cumulative`，然后 `drain()` 返回它并标记 emitted — 逻辑正确
-- 但如果 consumer 在 finalize 时传入的 `text` 已经是完整的累积文本（它确实是），那 chunker 的 `_cumulative` 可能之前从未被 `update()` 过，首次在 finalize 时调用 `update()` 是安全的
-- **真正的隐患：** 如果 consumer 传入的 `text` 比 chunker 已经 emitted 的内容少（异常场景），`drain()` 会返回 None，final_text 变成传入的 text — 这是正确的 fallback
+- consumer 在 finalize 时传入的是完整累积文本，`drain(text)` 只负责判断是否还有未发尾部，并推进 emitted length。
+- 如果 consumer 传入的 `text` 比 chunker 已经 emitted 的内容少（异常场景），`drain()` 返回 None，final_text 保持传入值，这是正确的 fallback。
 
 ---
 
@@ -132,21 +129,12 @@ send_stream_frame(finalize=True):
 
 | 维度 | openclaw 官方 | xwecom-hermes-plugin |
 |------|------|------|
-| **机制** | Core 内部 idleMs 定时器（每次收到 token 重置计时） | 250ms `call_later`，首次 arm 后**不重置** |
+| **机制** | Core 内部 idleMs 定时器（每次收到 token 重置计时） | 250ms `call_later`，每次 not-ready 都重置 |
 | **触发条件** | 收到 token 后 250ms 无新 token → force-emit | chunker.should_emit 返回 False 时 arm → 250ms 后 fire |
-| **重置行为** | 每次新 token 重置计时器 | **不重置** — 已 arm 时直接 return |
+| **重置行为** | 每次新 token 重置计时器 | 每次取消旧 timer 并重新 arm |
 | **效果差异** | LLM 持续出 token（间隔<250ms）时不会触发 | 一旦 arm，250ms 后必定触发一次，之后如果还没到 min_chars 又不会重新 arm |
 
-**关键差异：** 官方的 idle timer 是"最后一次 token 后 250ms 仍无新 token → flush"。我们的实现是"首次 not-ready 时 arm 250ms → fire once"。两者效果类似但语义不同：
-
-- 官方：token 间隔超过 250ms → flush
-- 我们：从 not-ready 开始计时 250ms → flush（但如果在 250ms 内又收到 token 使得 should_emit=True，flush 就是多余的 no-op）
-
-实际效果差不多，因为：
-1. 如果 250ms 内 chunker 变成 should_emit=True，正常路径会 emit 且 cancel idle
-2. 如果 250ms 内没有新 token，idle fire 时 cumulative 就是 turn.pending_cumulative，正确 emit
-
-**但有个 bug：** `_arm_idle_flush` 是幂等的（`if handle is not None: return`），fire 之后 handle 被设为 None。如果下次调用 send_stream_frame 时 chunker 又 not-ready，会重新 arm。所以实际行为接近正确。
+当前语义已经对齐官方：只有最后一次 not-ready 更新后持续 250ms 没有新内容，才 force emit `turn.pending_cumulative`。
 
 ---
 
@@ -157,12 +145,12 @@ send_stream_frame(finalize=True):
 | **Frame Cap** | 无显式限制（Core dispatcher 内部管理） | 无（Webhook 只有最终一帧） | 85 帧硬上限 (MAX_INTERMEDIATE_FRAMES) |
 | **超帧后行为** | N/A | N/A | 静默积累，最终 finalize 帧发送全部内容 |
 | **Content 字节限制** | 20,480 bytes (helpers.ts:STREAM_MAX_BYTES) | 同左 | 20,480 bytes (MAX_STREAM_CONTENT_LENGTH) |
-| **截断方式** | `truncateUtf8Bytes` — 保留尾部，截断头部 | 同左 | `_truncate_to_bytes` — 保留头部，截断尾部 |
-| **截断方向差异** | ⚠️ 保留最后 N 字节（用户看到最新内容） | 同左 | ⚠️ 保留前 N 字节（用户看到开头） |
+| **截断方式** | `truncateUtf8Bytes` — 保留尾部，截断头部 | 同左 | `_truncate_to_bytes` — 保留尾部，截断头部 |
+| **截断方向差异** | 保留最后 N 字节（用户看到最新内容） | 同左 | 已对齐 |
 
-**重大差异发现：** 截断方向不同！
+**状态：** 截断方向已对齐。
 - 官方：`buf.subarray(buf.length - maxBytes)` — 保留尾部
-- 我们：`encoded[:max_bytes]` — 保留头部
+- 我们：取 `encoded[len(encoded) - max_bytes:]`，再跳过 UTF-8 continuation bytes。
 
 在流式场景下，因为每帧发送的是 **累积内容**（cumulative），且后面的内容是最新的，官方选择截断头部、保留尾部是合理的 — 用户看到的气泡始终显示最新内容。
 
@@ -180,9 +168,9 @@ send_stream_frame(finalize=True):
 
 2. **BlockChunker 的"无状态 cumulative"模式是正确的** — consumer 每次传入完整的累积文本，chunker 只负责决定"是否该 emit"和"mark emitted 位置"。这比维护内部 buffer 更简单可靠。
 
-3. **应该改为"重置型 idle timer"** — 参考官方 Core 的 coalesce.idleMs 语义：每次收到新 token 时重置，只有真正"沉默 250ms"才 flush。
+3. **idle timer 已改为重置型** — 参考官方 Core 的 coalesce.idleMs 语义：每次收到新 token 时重置，只有真正"沉默 250ms"才 flush。
 
-4. **finalize 路径已经正确** — `update() → has_pending() → drain()` 的三步走确保尾部内容不丢失。
+4. **finalize 路径已经正确** — `drain(cumulative_text)` 确保尾部内容不丢失。
 
 ---
 
@@ -190,57 +178,26 @@ send_stream_frame(finalize=True):
 
 ### 高优先级（影响正确性）
 
-#### 1. 修复 UTF-8 截断方向
+#### 1. UTF-8 截断方向
 
-```python
-# 当前（保留头部）：
-cut = encoded[:max_bytes]
+已修复为保留尾部。超长 cumulative content 在 20KB 限制时，用户看到的是最新输出而非开头。
 
-# 建议改为对齐官方（保留尾部）：
-cut = encoded[len(encoded) - max_bytes:]
-```
+#### 2. idle flush 重置语义
 
-这样超长 cumulative content 在 20KB 限制时，用户看到的是最新输出而非开头。
-
-#### 2. 将 idle flush 改为"重置型"
-
-```python
-def _arm_idle_flush(self, turn, *, turn_id):
-    # 改为：每次都 cancel 旧的并重新 arm（重置计时）
-    self._cancel_idle_flush(turn)
-    if turn.finalized or turn.expired:
-        return
-    loop = asyncio.get_running_loop()
-    turn.idle_flush_handle = loop.call_later(
-        BLOCK_STREAM_IDLE_FLUSH,
-        self._on_idle_flush_fire,
-        turn,
-        turn_id,
-    )
-```
-
-当前的幂等逻辑（已有 handle 时 return）会导致：如果 LLM 连续出 token 但低于 min_chars，第一次 arm 后 250ms 就 flush 了一小段，不如等 LLM 真正"停下来"再 flush。
+已修复为每次 cancel 旧 timer 并重新 arm。
 
 ### 中优先级（提升鲁棒性）
 
-#### 3. 添加 6 分钟主动超时检测
+#### 3. 6 分钟主动超时检测
+
+已按二开版策略实现：4 分钟 keepalive，5 分钟主动 finish old stream 并换新 `stream_id` 继续，避免依赖 846608 errcode 的被动检测。
+
+#### 4. BlockChunker API
+
+已统一为显式参数：
 
 ```python
-# 在 send_stream_frame 入口处检查
-if turn.started_at and (time.time() - turn.started_at) > (6 * 60 - 30):
-    # 接近超时，提前 finalize 并回退到 send()
-    turn.expired = True
-    return False
-```
-
-避免依赖 846608 errcode 的被动检测（网络延迟可能导致检测不及时）。
-
-#### 4. 清理 BlockChunker 的 `_cumulative` 状态
-
-`update()`/`has_pending()`/`drain()` 虽然能工作，但引入了隐式状态 `_cumulative`。建议统一为显式参数：
-
-```python
-def drain(self, cumulative_text: str, force: bool = False) -> Optional[str]:
+def drain(self, cumulative_text: str) -> Optional[str]:
     """Return cumulative_text if there's pending content."""
     if len(cumulative_text) <= self._emitted_len:
         return None
@@ -248,17 +205,17 @@ def drain(self, cumulative_text: str, force: bool = False) -> Optional[str]:
     return cumulative_text
 ```
 
-这样 finalize 路径就不需要先 `update()` 再 `drain()`，直接 `drain(text, force=True)` 即可。
+finalize 路径直接 `drain(text)`。
 
 ### 低优先级（对齐最佳实践）
 
-#### 5. 考虑添加消息防抖聚合
+#### 5. 消息防抖聚合
 
-如果用户在短时间内连发多条消息（如发文字+图片），当前每条消息各开一个 stream turn，会导致多个"思考中"气泡。官方的 500ms 防抖可以合并为一批。
+已迁移为同 session 纯文本批处理：短时间连续文字合并后投递，媒体消息保持即时处理。
 
-#### 6. 考虑 dmContent 私信兜底通道
+#### 6. 超长完整内容兜底
 
-对于超长回复（如代码生成），20KB 限制可能导致内容被截断。官方的做法是另外维护一份 dmContent（200KB 上限），超时时通过 Agent 私信发送完整内容。
+对于超长回复（如代码生成），20KB 限制可能导致 stream final 只显示尾部。当前 Hermes 版会在 final 被截断时，通过 AI Bot WS `send_message` 按 UTF-8 安全分块主动补发完整内容，达到 OpenClaw dmContent 兜底的同类效果。
 
 ---
 
@@ -269,7 +226,7 @@ def drain(self, cumulative_text: str, force: bool = False) -> Optional[str]:
 | 官方 TS 最佳 | 是，但强依赖 OpenClaw Core，不可直接移植 |
 | Python SDK 可参考 | 否，太简陋，无分块逻辑 |
 | 我们的设计方向 | ✅ 正确 — 独立 BlockChunker + idle flush + frame cap |
-| 需要修复 | UTF-8 截断方向、idle flush 重置行为 |
-| 需要增强 | 6 分钟主动超时、BlockChunker API 简化 |
+| 需要修复 | 已知高优先级细节已修复：UTF-8 尾部截断、idle flush 重置、BlockChunker 显式 drain、ACK pending 跳帧 |
+| 需要增强 | 暂无已确认的流式正确性缺口 |
 
-**核心结论：** xwecom-hermes-plugin 的流式架构设计方向是对的，参数也已对齐官方。当前最大的技术债不是 BlockChunker 本身，而是 **UTF-8 截断方向** 和 **idle flush 的重置语义** 两个细节差异。修复后即可认为基本对齐官方最佳实践。
+**核心结论：** xwecom-hermes-plugin 的流式架构设计方向是对的，参数和主要正确性细节已对齐官方。HTTP callback inbound 已在 adapter 内通过可选 aiohttp listener 接入；同会话短时间纯文本消息防抖聚合也已补齐。

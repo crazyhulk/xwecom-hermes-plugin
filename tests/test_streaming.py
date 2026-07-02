@@ -25,6 +25,10 @@ def _make_adapter():
     the streaming fields the consumer would otherwise rely on.
     """
     from adapter import XWeComAdapter
+    from message_sender import NonBlockingStreamGate
+    from monitor import DEFAULT_MESSAGE_PROCESS_TIMEOUT_S, SessionRecorder
+    from state_manager import get_state_manager
+    from template_card import TemplateCardCache
 
     with patch("adapter.BasePlatformAdapter.__init__", return_value=None):
         adapter = XWeComAdapter.__new__(XWeComAdapter)
@@ -33,6 +37,19 @@ def _make_adapter():
     adapter._last_chat_frames = {}
     adapter._stream_turns = {}
     adapter._stream_expired_chats = set()
+    adapter._stream_gate = NonBlockingStreamGate()
+    adapter._state = get_state_manager()
+    adapter._account_id = "test"
+    adapter._session_recorder = SessionRecorder()
+    adapter._template_card_cache = TemplateCardCache()
+    adapter._message_timeout_s = DEFAULT_MESSAGE_PROCESS_TIMEOUT_S
+    adapter._welcome_text = ""
+    adapter._stream_keepalive_interval_s = 240.0
+    adapter._stream_rotate_after_s = 300.0
+    adapter._text_batch_delay_s = 0.0
+    adapter._text_batch_split_delay_s = 0.0
+    adapter._pending_text_batches = {}
+    adapter._pending_text_batch_tasks = {}
     return adapter
 
 
@@ -55,6 +72,17 @@ class TestSupportsNativeStreaming:
         assert adapter.supports_native_streaming() is True
         assert adapter.supports_native_streaming(chat_type="group") is True
         assert adapter.supports_native_streaming(chat_type="dm") is True
+
+
+class TestTextByteChunking:
+    def test_split_text_by_byte_limit_preserves_content(self):
+        from adapter import XWeComAdapter
+
+        text = "第一行\n" + ("中文内容" * 20) + "\n最后一行"
+        chunks = XWeComAdapter._split_text_by_byte_limit(text, 60)
+        assert "".join(chunks) == text
+        assert len(chunks) > 1
+        assert all(len(chunk.encode("utf-8")) <= 60 for chunk in chunks)
 
 
 class TestSendStreamFrameRejects:
@@ -160,6 +188,82 @@ class TestIntermediateFrames:
         # Only the seed frame so far.
         assert client.reply_stream.await_count == 1
 
+    async def test_pending_ack_skips_intermediate_frame(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")
+        turn = next(iter(adapter._stream_turns.values()))
+        await adapter._stream_gate.try_acquire(turn.stream_id, finish=False)
+
+        client.reply_stream.reset_mock()
+        long_text = "这是一段足够长的文字。" * 30
+        ok = await adapter.send_stream_frame(long_text, chat_id="chat1")
+
+        assert ok is True
+        assert client.reply_stream.await_count == 0
+
+        ok = await adapter.send_stream_frame(
+            long_text + "结尾", chat_id="chat1", finalize=True
+        )
+        assert ok is True
+        assert client.reply_stream.await_count == 1
+        assert client.reply_stream.await_args.args[3] is True
+
+    async def test_keepalive_replays_last_non_empty_content(self):
+        adapter = _make_adapter()
+        adapter._stream_keepalive_interval_s = 0.01
+        adapter._stream_rotate_after_s = 0
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")
+        long_text = "这是一段足够长的文字。" * 30
+        await adapter.send_stream_frame(long_text, chat_id="chat1")
+        sent_before = client.reply_stream.await_count
+
+        await asyncio.sleep(0.03)
+
+        assert client.reply_stream.await_count > sent_before
+        assert client.reply_stream.await_args.args[2] == long_text
+        assert client.reply_stream.await_args.args[3] is False
+
+    async def test_rotation_finishes_old_stream_and_continues_with_delta(self):
+        adapter = _make_adapter()
+        adapter._stream_keepalive_interval_s = 0
+        adapter._stream_rotate_after_s = 0.01
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+
+        await adapter.send_stream_frame("", chat_id="chat1")
+        first_visible = "第一段足够长的文字。" * 30
+        await adapter.send_stream_frame(first_visible, chat_id="chat1")
+        turn = next(iter(adapter._stream_turns.values()))
+        old_stream_id = turn.stream_id
+
+        await asyncio.sleep(0.03)
+
+        turn = next(iter(adapter._stream_turns.values()))
+        assert turn.stream_id != old_stream_id
+        calls = [call.args for call in client.reply_stream.await_args_list]
+        assert any(args[1] == old_stream_id and args[3] is True for args in calls)
+        assert calls[-1][1] == turn.stream_id
+        assert calls[-1][2] == "<think></think>"
+        assert calls[-1][3] is False
+
+        client.reply_stream.reset_mock()
+        second_visible = first_visible + ("第二段足够长的文字。" * 30)
+        await adapter.send_stream_frame(second_visible, chat_id="chat1")
+
+        assert client.reply_stream.await_count == 1
+        assert "第一段" not in client.reply_stream.await_args.args[2]
+        assert "第二段" in client.reply_stream.await_args.args[2]
+
 
 class TestFinalize:
     """The closing ``finish=True`` frame."""
@@ -180,6 +284,32 @@ class TestFinalize:
         assert last[3] is True  # finish=True
         # Turn cleaned up so the next inbound message starts fresh.
         assert adapter._stream_turns == {}
+
+    async def test_finalize_truncation_sends_full_content_fallback(self):
+        from constants import MAX_STREAM_CONTENT_LENGTH
+
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        client.send_message = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+        await adapter.send_stream_frame("", chat_id="chat1")
+
+        full_text = "开头内容\n" + ("中间内容。" * 5000) + "\n结尾内容"
+        ok = await adapter.send_stream_frame(
+            full_text, chat_id="chat1", finalize=True
+        )
+
+        assert ok is True
+        final_content = client.reply_stream.await_args.args[2]
+        assert len(final_content.encode("utf-8")) <= MAX_STREAM_CONTENT_LENGTH
+        assert "结尾内容" in final_content
+        assert "开头内容" not in final_content
+        assert client.send_message.await_count > 0
+        fallback_text = client.send_message.await_args_list[0].args[1]["markdown"]["content"]
+        assert "完整回复" in fallback_text
+        assert "开头内容" in fallback_text
 
 
 class TestFrameCap:

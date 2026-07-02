@@ -12,10 +12,13 @@ import asyncio
 import json
 import logging
 import os
+import re
+import socket
 import time
 import uuid
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -24,6 +27,12 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+
+try:
+    from aiohttp import ClientSession, web
+except ImportError:
+    ClientSession = None  # type: ignore[assignment]
+    web = None  # type: ignore[assignment]
 
 try:
     from gateway.platforms.base import cache_document_from_bytes, cache_image_from_bytes
@@ -47,26 +56,46 @@ try:
         MAX_MESSAGE_LENGTH,
         MAX_STREAM_CONTENT_LENGTH,
         STREAM_EXPIRED_ERRCODE,
+        STREAM_KEEPALIVE_INTERVAL_SECONDS,
+        STREAM_ROTATE_AFTER_SECONDS,
+        TEXT_BATCH_DELAY_SECONDS,
+        TEXT_BATCH_SPLIT_DELAY_SECONDS,
+        TEXT_BATCH_SPLIT_THRESHOLD,
+    )
+    from .callback import (
+        ParsedCallbackMessage,
+        decrypt_callback_message,
+        decrypt_verified_callback_message,
+        extract_encrypt_from_xml,
+        parse_callback_message_xml,
+        verify_callback_signature,
     )
     from .media import (
         check_file_size,
         detect_media_type,
         download_and_decrypt,
+        upload_and_send_media,
         upload_media_chunked,
     )
     from .message_parser import parse_message_content, parse_message_simple
-    from .message_sender import THINKING_MESSAGE
+    from .message_sender import NonBlockingStreamGate, THINKING_MESSAGE
     from .monitor import (
         BufferedBlockDispatcher,
+        DEFAULT_MESSAGE_PROCESS_TIMEOUT_S,
         SessionRecorder,
         SessionRecord,
         handle_disconnected_event,
         handle_enter_chat_event,
+        run_with_message_timeout,
     )
     from .policy import check_dm_policy, check_group_policy
     from .state_manager import get_state_manager
     from .stream import BlockChunker, BlockStreamManager, StreamExpiredError
-    from .template_card import TemplateCardCache
+    from .template_card import (
+        TemplateCardCache,
+        mask_template_card_blocks,
+        process_template_cards_if_needed,
+    )
 except ImportError:
     from sdk import WSClient, WSClientOptions  # type: ignore[no-redef]
     from constants import (  # type: ignore[no-redef]
@@ -77,28 +106,61 @@ except ImportError:
         MAX_MESSAGE_LENGTH,
         MAX_STREAM_CONTENT_LENGTH,
         STREAM_EXPIRED_ERRCODE,
+        STREAM_KEEPALIVE_INTERVAL_SECONDS,
+        STREAM_ROTATE_AFTER_SECONDS,
+        TEXT_BATCH_DELAY_SECONDS,
+        TEXT_BATCH_SPLIT_DELAY_SECONDS,
+        TEXT_BATCH_SPLIT_THRESHOLD,
     )
     from media import (  # type: ignore[no-redef]
         check_file_size,
         detect_media_type,
         download_and_decrypt,
+        upload_and_send_media,
         upload_media_chunked,
     )
     from message_parser import parse_message_content, parse_message_simple  # type: ignore[no-redef]
-    from message_sender import THINKING_MESSAGE  # type: ignore[no-redef]
+    from message_sender import NonBlockingStreamGate, THINKING_MESSAGE  # type: ignore[no-redef]
     from monitor import (  # type: ignore[no-redef]
         BufferedBlockDispatcher,
+        DEFAULT_MESSAGE_PROCESS_TIMEOUT_S,
         SessionRecorder,
         SessionRecord,
         handle_disconnected_event,
         handle_enter_chat_event,
+        run_with_message_timeout,
     )
     from policy import check_dm_policy, check_group_policy  # type: ignore[no-redef]
     from state_manager import get_state_manager  # type: ignore[no-redef]
     from stream import BlockChunker, BlockStreamManager, StreamExpiredError  # type: ignore[no-redef]
-    from template_card import TemplateCardCache  # type: ignore[no-redef]
+    from template_card import (  # type: ignore[no-redef]
+        TemplateCardCache,
+        mask_template_card_blocks,
+        process_template_cards_if_needed,
+    )
+    from callback import (  # type: ignore[no-redef]
+        ParsedCallbackMessage,
+        decrypt_callback_message,
+        decrypt_verified_callback_message,
+        extract_encrypt_from_xml,
+        parse_callback_message_xml,
+        verify_callback_signature,
+    )
 
 logger = logging.getLogger(__name__)
+
+
+REPLY_MEDIA_DIRECTIVE_RE = re.compile(
+    r"^\s*(?:[-*]\s+|\d+\.\s+)?(?:MEDIA|FILE)\s*:\s*(.+?)\s*$",
+    re.IGNORECASE,
+)
+
+DEFAULT_CALLBACK_HOST = "0.0.0.0"
+DEFAULT_CALLBACK_PORT = 8645
+DEFAULT_CALLBACK_PATH = "/wecom/callback"
+MAX_CALLBACK_BODY_BYTES = 65_536
+CALLBACK_MESSAGE_DEDUP_TTL_SECONDS = 300
+ACCESS_TOKEN_TTL_SECONDS = 7200
 
 
 class MessageDeduplicator:
@@ -152,7 +214,12 @@ class StreamTurn:
         "frame_count",
         "last_sent_content",
         "pending_cumulative",
+        "base_cumulative_len",
+        "last_wire_content",
+        "full_content_fallback_sent",
         "idle_flush_handle",
+        "keepalive_handle",
+        "rotation_handle",
         "start_time",
     )
 
@@ -171,7 +238,12 @@ class StreamTurn:
         # the chunker is stateless wrt cumulative storage so the idle-flush
         # timer needs it here to know what to drain.
         self.pending_cumulative = ""
+        self.base_cumulative_len = 0
+        self.last_wire_content = THINKING_MESSAGE
+        self.full_content_fallback_sent = False
         self.idle_flush_handle: Optional[asyncio.TimerHandle] = None
+        self.keepalive_handle: Optional[asyncio.TimerHandle] = None
+        self.rotation_handle: Optional[asyncio.TimerHandle] = None
         self.start_time = time.monotonic()
 
 
@@ -203,12 +275,59 @@ class XWeComAdapter(BasePlatformAdapter):
         self._allow_from = self._coerce_list(extra.get("allow_from"))
         self._group_allow_from = self._coerce_list(extra.get("group_allow_from"))
         self._groups_config = extra.get("groups", {})
+        self._welcome_text = extra.get("welcome_text") or os.getenv("XWECOM_WELCOME_TEXT", "")
+        self._message_timeout_s = float(
+            extra.get("message_timeout_s", DEFAULT_MESSAGE_PROCESS_TIMEOUT_S)
+        )
+        self._stream_keepalive_interval_s = float(
+            extra.get("stream_keepalive_interval_s", STREAM_KEEPALIVE_INTERVAL_SECONDS)
+        )
+        self._stream_rotate_after_s = float(
+            extra.get("stream_rotate_after_s", STREAM_ROTATE_AFTER_SECONDS)
+        )
+        self._text_batch_delay_s = float(
+            extra.get("text_batch_delay_s", TEXT_BATCH_DELAY_SECONDS)
+        )
+        self._text_batch_split_delay_s = float(
+            extra.get("text_batch_split_delay_s", TEXT_BATCH_SPLIT_DELAY_SECONDS)
+        )
+
+        # Optional self-built app HTTP callback channel.  This is disabled by
+        # default so the plugin keeps the existing AI Bot WebSocket behavior
+        # unless explicitly configured.
+        self._callback_enabled = self._truthy(
+            extra.get("callback_enabled") or os.getenv("XWECOM_CALLBACK_ENABLED")
+        )
+        self._callback_host = str(
+            extra.get("callback_host")
+            or os.getenv("XWECOM_CALLBACK_HOST", DEFAULT_CALLBACK_HOST)
+        )
+        self._callback_port = int(
+            extra.get("callback_port")
+            or os.getenv("XWECOM_CALLBACK_PORT", DEFAULT_CALLBACK_PORT)
+        )
+        self._callback_path = self._normalize_callback_path(
+            extra.get("callback_path")
+            or os.getenv("XWECOM_CALLBACK_PATH", DEFAULT_CALLBACK_PATH)
+        )
+        self._callback_apps = self._normalize_callback_apps(extra)
+        self._callback_runner: Optional[Any] = None
+        self._callback_site: Optional[Any] = None
+        self._callback_http_session: Optional[Any] = None
+        self._callback_seen_messages: Dict[str, float] = {}
+        self._callback_chat_apps: Dict[str, str] = {}
+        self._callback_access_tokens: Dict[str, Dict[str, Any]] = {}
 
         # Internal state
         self._client: Optional[WSClient] = None
         self._stream_mgr = BlockStreamManager()
         self._dedup = MessageDeduplicator()
         self._lock_acquired = False
+        self._account_id = extra.get("account_id") or self._bot_id or "default"
+        self._state = get_state_manager()
+        self._session_recorder = SessionRecorder()
+        self._template_card_cache = TemplateCardCache()
+        self._stream_gate = NonBlockingStreamGate()
 
         # Native-streaming bookkeeping. ``_last_chat_req_ids`` maps each chat
         # to the most recent inbound req_id (WeCom binds stream replies to
@@ -221,6 +340,8 @@ class XWeComAdapter(BasePlatformAdapter):
         self._last_chat_frames: Dict[str, Dict[str, Any]] = {}
         self._stream_turns: Dict[str, StreamTurn] = {}
         self._stream_expired_chats: set = set()
+        self._pending_text_batches: Dict[str, MessageEvent] = {}
+        self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
     @staticmethod
     def _coerce_list(value: Any) -> List[str]:
@@ -233,19 +354,109 @@ class XWeComAdapter(BasePlatformAdapter):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
 
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on", "enabled"}
+
+    @staticmethod
+    def _normalize_callback_path(value: Any) -> str:
+        path = str(value or DEFAULT_CALLBACK_PATH).strip() or DEFAULT_CALLBACK_PATH
+        return path if path.startswith("/") else f"/{path}"
+
+    @staticmethod
+    def _normalize_callback_apps(extra: Dict[str, Any]) -> List[Dict[str, Any]]:
+        apps = extra.get("callback_apps")
+        if isinstance(apps, list) and apps:
+            normalized = [dict(app) for app in apps if isinstance(app, dict)]
+        else:
+            normalized = [
+                {
+                    "name": extra.get("callback_name")
+                    or os.getenv("XWECOM_CALLBACK_NAME", "default"),
+                    "corp_id": extra.get("corp_id") or os.getenv("XWECOM_CORP_ID", ""),
+                    "corp_secret": extra.get("corp_secret")
+                    or os.getenv("XWECOM_CORP_SECRET", ""),
+                    "agent_id": str(
+                        extra.get("agent_id") or os.getenv("XWECOM_AGENT_ID", "")
+                    ),
+                    "token": extra.get("callback_token")
+                    or extra.get("token")
+                    or os.getenv("XWECOM_CALLBACK_TOKEN", ""),
+                    "encoding_aes_key": extra.get("encoding_aes_key")
+                    or os.getenv("XWECOM_ENCODING_AES_KEY", ""),
+                }
+            ]
+
+        result: List[Dict[str, Any]] = []
+        for idx, app in enumerate(normalized):
+            name = str(app.get("name") or f"app{idx + 1}")
+            result.append(
+                {
+                    "name": name,
+                    "corp_id": str(app.get("corp_id") or ""),
+                    "corp_secret": str(app.get("corp_secret") or ""),
+                    "agent_id": str(app.get("agent_id") or ""),
+                    "token": str(app.get("token") or ""),
+                    "encoding_aes_key": str(app.get("encoding_aes_key") or ""),
+                }
+            )
+        return result
+
+    @staticmethod
+    def _callback_app_configured(app: Dict[str, Any]) -> bool:
+        return bool(
+            app.get("corp_id")
+            and app.get("token")
+            and app.get("encoding_aes_key")
+        )
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Establish WebSocket connection to WeCom."""
-        if not self._bot_id or not self._secret:
-            logger.error("xwecom: bot_id and secret are required")
+        """Establish configured WeCom channels."""
+        has_ws_credentials = bool(self._bot_id and self._secret)
+        has_callback_credentials = self._callback_enabled and any(
+            self._callback_app_configured(app) for app in self._callback_apps
+        )
+        if not has_ws_credentials and not has_callback_credentials:
+            logger.error(
+                "xwecom: bot_id/secret or callback corp_id/token/encoding_aes_key are required"
+            )
             return False
 
-        # Token lock — prevent two profiles from using same credential
-        if acquire_scoped_lock is not None:
+        # Token lock — prevent two profiles from using same WS credential.
+        if has_ws_credentials and acquire_scoped_lock is not None:
             if not acquire_scoped_lock("xwecom", self._bot_id):
                 logger.error("xwecom: Token already in use by another profile")
                 return False
             self._lock_acquired = True
 
+        try:
+            if has_ws_credentials:
+                await self._connect_ws()
+            if self._callback_enabled:
+                await self._start_callback_server()
+            self._state.start_cleanup()
+            self._mark_connected()
+            logger.info("xwecom: adapter connected and ready")
+            return True
+        except Exception as e:
+            logger.error(f"xwecom: connection failed - {e}")
+            await self._stop_callback_server()
+            if self._client:
+                try:
+                    self._client.disconnect()
+                except Exception:
+                    pass
+                self._client = None
+            if self._lock_acquired and release_scoped_lock is not None:
+                release_scoped_lock("xwecom", self._bot_id)
+                self._lock_acquired = False
+            return False
+
+    async def _connect_ws(self) -> None:
         opts = WSClientOptions(
             bot_id=self._bot_id,
             secret=self._secret,
@@ -267,19 +478,16 @@ class XWeComAdapter(BasePlatformAdapter):
             "disconnected",
             lambda reason="": logger.warning(f"xwecom: disconnected - {reason}"),
         )
-        self._client.on("error", lambda e: logger.error(f"xwecom: error - {e}", exc_info=isinstance(e, BaseException)))
+        self._client.on(
+            "error",
+            lambda e: logger.error(
+                f"xwecom: error - {e}", exc_info=isinstance(e, BaseException)
+            ),
+        )
 
-        try:
-            await self._client.connect()
-            self._mark_connected()
-            logger.info("xwecom: adapter connected and ready")
-            return True
-        except Exception as e:
-            logger.error(f"xwecom: connection failed - {e}")
-            if self._lock_acquired and release_scoped_lock is not None:
-                release_scoped_lock("xwecom", self._bot_id)
-                self._lock_acquired = False
-            return False
+        await self._client.connect()
+        self._state.set_ws_client(self._account_id, self._client)
+        self._state.set_connection_state(self._account_id, "connected")
 
     async def disconnect(self) -> None:
         """Clean shutdown."""
@@ -291,6 +499,10 @@ class XWeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids.clear()
         self._last_chat_frames.clear()
         self._stream_expired_chats.clear()
+        for task in list(self._pending_text_batch_tasks.values()):
+            task.cancel()
+        self._pending_text_batch_tasks.clear()
+        self._pending_text_batches.clear()
 
         if self._client:
             try:
@@ -299,6 +511,10 @@ class XWeComAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning(f"xwecom: disconnect error - {e}")
             self._client = None
+        await self._stop_callback_server()
+        self._state.delete_ws_client(self._account_id)
+        self._state.set_connection_state(self._account_id, "disconnected")
+        self._state.stop_cleanup()
 
         if self._lock_acquired and release_scoped_lock is not None:
             release_scoped_lock("xwecom", self._bot_id)
@@ -314,10 +530,40 @@ class XWeComAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send a text message (proactive push via aibot_send_msg)."""
+        callback_app = self._resolve_callback_app_for_chat(chat_id)
+        if callback_app is not None:
+            return await self._send_callback_text(callback_app, chat_id, content)
+
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
-        body = {"msgtype": "markdown", "markdown": {"content": content}}
+        outbound_text = content
+        card_frame = self._build_outbound_frame(chat_id, reply_to)
+        try:
+            card_result = await process_template_cards_if_needed(
+                self._client,
+                card_frame,
+                accumulated_text=content,
+                account_id=self._account_id,
+                cache=self._template_card_cache,
+            )
+            if card_result is not None:
+                outbound_text = card_result.remaining_text
+        except Exception as err:  # noqa: BLE001
+            logger.warning("xwecom: proactive template card send failed: %s", err)
+
+        outbound_text = await self._process_reply_media_directives(
+            chat_id,
+            outbound_text,
+        )
+
+        if not outbound_text.strip():
+            return SendResult(
+                success=True,
+                message_id=f"xwecom_{chat_id}_{int(time.time() * 1000)}",
+            )
+
+        body = {"msgtype": "markdown", "markdown": {"content": outbound_text}}
         try:
             resp = await self._client.send_message(chat_id, body)
             errcode = resp.get("errcode", resp.get("data", {}).get("errcode", 0))
@@ -332,6 +578,21 @@ class XWeComAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error(f"xwecom send failed: {e}")
             return SendResult(success=False, error=str(e))
+
+    @staticmethod
+    def _build_outbound_frame(
+        chat_id: str,
+        reply_to: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Build a minimal frame for proactive helpers that expect WsFrame."""
+        return {
+            "headers": {"req_id": reply_to or f"proactive_{uuid.uuid4().hex[:12]}"},
+            "body": {
+                "chatid": chat_id,
+                "from": {"userid": chat_id},
+                "chattype": "group" if XWeComAdapter._is_group_chat(chat_id) else "single",
+            },
+        }
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Return chat metadata."""
@@ -351,6 +612,32 @@ class XWeComAdapter(BasePlatformAdapter):
         official OpenClaw plugin (``src/message-parser.ts:MessageBody``):
         ``msgid``, ``chattype`` ("single"|"group"), ``chatid``,
         ``from.userid`` / ``from.corpid``, ``msgtype``, etc.
+        """
+        await self._dispatch_frame_with_timeout(frame)
+
+    async def _dispatch_frame_with_timeout(self, frame: Dict[str, Any]) -> None:
+        body = frame.get("body") or {}
+        headers = frame.get("headers") or {}
+        msg_id = body.get("msgid") or headers.get("req_id") or ""
+
+        async def on_timeout() -> None:
+            if msg_id:
+                await self._session_recorder.close(msg_id, error="timeout")
+
+        try:
+            await run_with_message_timeout(
+                self._dispatch_frame_as_message(frame),
+                timeout_s=self._message_timeout_s,
+                on_timeout=on_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("xwecom: message processing timed out msg_id=%s", msg_id)
+
+    async def _dispatch_frame_as_message(self, frame: Dict[str, Any]) -> None:
+        """Parse, policy-check, cache media, and forward a frame to Hermes.
+
+        Aligned with OpenClaw: monitor.ts:processWeComMessageNow, while keeping
+        Hermes' BasePlatformAdapter.handle_message as the dispatch boundary.
         """
         body = frame.get("body") or {}
         headers = frame.get("headers") or {}
@@ -388,6 +675,7 @@ class XWeComAdapter(BasePlatformAdapter):
         if chat_id and req_id:
             self._last_chat_req_ids[chat_id] = req_id
             self._last_chat_frames[chat_id] = frame
+            self._state.set_reqid_for_chat(chat_id, req_id, self._account_id)
             # Cap memory: prune oldest entries beyond DEDUP_MAX_SIZE.
             while len(self._last_chat_req_ids) > DEDUP_MAX_SIZE:
                 drop = next(iter(self._last_chat_req_ids))
@@ -486,7 +774,112 @@ class XWeComAdapter(BasePlatformAdapter):
             event.metadata = {}
         event.metadata["_xwecom_frame"] = frame  # type: ignore[attr-defined]
 
+        if msg_id:
+            await self._session_recorder.open(
+                SessionRecord(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    message_id=msg_id,
+                    req_id=req_id,
+                    stream_id="",
+                )
+            )
+
+        try:
+            handled_now = await self._dispatch_event_to_hermes(event)
+        except Exception as err:
+            if msg_id:
+                await self._session_recorder.close(msg_id, error=str(err))
+            raise
+        else:
+            if msg_id and handled_now:
+                await self._session_recorder.close(msg_id)
+
+    async def _dispatch_event_to_hermes(self, event: MessageEvent) -> bool:
+        """Dispatch an event, batching rapid plain-text chunks per session.
+
+        Returns True when ``handle_message`` completed before returning. A
+        False return means a text batch owns the eventual dispatch and session
+        recorder close.
+        """
+        if (
+            event.message_type == MessageType.TEXT
+            and not getattr(event, "media_urls", None)
+            and self._text_batch_delay_s > 0
+        ):
+            self._enqueue_text_event(event)
+            return False
         await self.handle_message(event)
+        return True
+
+    def _text_batch_key(self, event: MessageEvent) -> str:
+        source = event.source
+        chat_id = getattr(source, "chat_id", None)
+        user_id = getattr(source, "user_id", None)
+        thread_id = getattr(source, "thread_id", None)
+        if isinstance(source, dict):
+            chat_id = source.get("chat_id")
+            user_id = source.get("user_id")
+            thread_id = source.get("thread_id")
+        return ":".join(str(part or "") for part in (chat_id, user_id, thread_id))
+
+    def _enqueue_text_event(self, event: MessageEvent) -> None:
+        key = self._text_batch_key(event)
+        existing = self._pending_text_batches.get(key)
+        chunk_len = len(event.text or "")
+        if existing is None:
+            setattr(event, "_xwecom_last_chunk_len", chunk_len)
+            setattr(
+                event,
+                "_xwecom_batch_message_ids",
+                [event.message_id] if event.message_id else [],
+            )
+            self._pending_text_batches[key] = event
+        else:
+            if event.text:
+                existing.text = (
+                    f"{existing.text}\n{event.text}" if existing.text else event.text
+                )
+            setattr(existing, "_xwecom_last_chunk_len", chunk_len)
+            batch_ids = list(getattr(existing, "_xwecom_batch_message_ids", []))
+            if event.message_id:
+                batch_ids.append(event.message_id)
+            setattr(existing, "_xwecom_batch_message_ids", batch_ids)
+
+        prior = self._pending_text_batch_tasks.get(key)
+        if prior and not prior.done():
+            prior.cancel()
+        task = asyncio.create_task(self._flush_text_batch(key))
+        self._pending_text_batch_tasks[key] = task
+
+    async def _flush_text_batch(self, key: str) -> None:
+        current_task = asyncio.current_task()
+        try:
+            pending = self._pending_text_batches.get(key)
+            last_len = getattr(pending, "_xwecom_last_chunk_len", 0) if pending else 0
+            delay = (
+                self._text_batch_split_delay_s
+                if last_len >= TEXT_BATCH_SPLIT_THRESHOLD
+                else self._text_batch_delay_s
+            )
+            await asyncio.sleep(delay)
+            if self._pending_text_batch_tasks.get(key) is not current_task:
+                return
+            event = self._pending_text_batches.pop(key, None)
+            if event is not None:
+                batch_ids = list(getattr(event, "_xwecom_batch_message_ids", []))
+                try:
+                    await self.handle_message(event)
+                except Exception as err:
+                    for msg_id in batch_ids:
+                        await self._session_recorder.close(msg_id, error=str(err))
+                    raise
+                else:
+                    for msg_id in batch_ids:
+                        await self._session_recorder.close(msg_id)
+        finally:
+            if self._pending_text_batch_tasks.get(key) is current_task:
+                self._pending_text_batch_tasks.pop(key, None)
 
     async def _on_event(self, frame: Dict[str, Any]) -> None:
         """Handle WeCom events (enter_chat, etc.)."""
@@ -494,6 +887,436 @@ class XWeComAdapter(BasePlatformAdapter):
         event_obj = body.get("event") or {}
         event_type = event_obj.get("eventtype", "unknown")
         logger.debug(f"xwecom: received event: {event_type}")
+        if not self._client:
+            return
+
+        if await handle_disconnected_event(
+            frame,
+            self._client,
+            on_kicked=self._on_kicked_by_wecom,
+        ):
+            self._mark_disconnected()
+            self._state.set_connection_state(self._account_id, "displaced")
+            return
+
+        if await handle_enter_chat_event(
+            frame,
+            self._client,
+            welcome_text=self._welcome_text,
+        ):
+            return
+
+        if event_type == "template_card_event":
+            try:
+                await self._update_template_card_on_event(frame)
+            except Exception as err:  # noqa: BLE001
+                logger.warning("xwecom: template card update failed: %s", err)
+
+        parsed = parse_message_content(body)
+        if parsed.text:
+            await self._dispatch_frame_with_timeout(frame)
+
+    async def _on_kicked_by_wecom(self, reason: str) -> None:
+        logger.warning("xwecom: %s", reason)
+        self._client = None
+
+    async def _update_template_card_on_event(self, frame: Dict[str, Any]) -> bool:
+        """Update cached template card state on click/select callbacks.
+
+        Aligned with OpenClaw: template-card-manager.ts:updateTemplateCardOnEvent.
+        """
+        try:
+            from .template_card import update_template_card_on_event
+        except ImportError:  # pragma: no cover
+            from template_card import update_template_card_on_event  # type: ignore[no-redef]
+
+        if not self._client:
+            return False
+        return await update_template_card_on_event(
+            self._client,
+            frame,
+            account_id=self._account_id,
+            cache=self._template_card_cache,
+        )
+
+    # ── Self-built app HTTP callback handling ──────────────────────────────
+
+    async def _start_callback_server(self) -> None:
+        if not self._callback_enabled:
+            return
+        if web is None or ClientSession is None:
+            raise RuntimeError("aiohttp is required for xwecom callback server")
+        valid_apps = [
+            app for app in self._callback_apps if self._callback_app_configured(app)
+        ]
+        if not valid_apps:
+            raise RuntimeError("xwecom callback enabled but no callback app is configured")
+        self._callback_apps = valid_apps
+
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.settimeout(1)
+                sock.connect(("127.0.0.1", self._callback_port))
+            raise RuntimeError(f"callback port {self._callback_port} already in use")
+        except (ConnectionRefusedError, OSError):
+            pass
+
+        self._callback_http_session = ClientSession()
+        app = web.Application(client_max_size=MAX_CALLBACK_BODY_BYTES)
+        app.router.add_get("/health", self._handle_callback_health)
+        app.router.add_get(self._callback_path, self._handle_callback_verify)
+        app.router.add_post(self._callback_path, self._handle_callback_post)
+        self._callback_runner = web.AppRunner(app)
+        await self._callback_runner.setup()
+        self._callback_site = web.TCPSite(
+            self._callback_runner,
+            self._callback_host,
+            self._callback_port,
+        )
+        await self._callback_site.start()
+        logger.info(
+            "xwecom: callback server listening on %s:%s%s",
+            self._callback_host,
+            self._callback_port,
+            self._callback_path,
+        )
+
+    async def _stop_callback_server(self) -> None:
+        self._callback_site = None
+        if self._callback_runner is not None:
+            try:
+                await self._callback_runner.cleanup()
+            except Exception as err:  # noqa: BLE001
+                logger.warning("xwecom: callback server cleanup failed: %s", err)
+            self._callback_runner = None
+        if self._callback_http_session is not None:
+            try:
+                await self._callback_http_session.close()
+            except Exception as err:  # noqa: BLE001
+                logger.warning("xwecom: callback HTTP session cleanup failed: %s", err)
+            self._callback_http_session = None
+
+    async def _handle_callback_health(self, request: Any) -> Any:
+        del request
+        return web.json_response({"status": "ok", "platform": "xwecom"})
+
+    async def _handle_callback_verify(self, request: Any) -> Any:
+        msg_signature = request.query.get("msg_signature", "")
+        timestamp = request.query.get("timestamp", "")
+        nonce = request.query.get("nonce", "")
+        echostr = request.query.get("echostr", "")
+
+        for app in self._callback_apps:
+            try:
+                if not verify_callback_signature(
+                    token=str(app.get("token") or ""),
+                    timestamp=timestamp,
+                    nonce=nonce,
+                    msg_encrypt=echostr,
+                    signature=msg_signature,
+                ):
+                    continue
+                decrypted = decrypt_callback_message(
+                    encoding_aes_key=str(app.get("encoding_aes_key") or ""),
+                    encrypted=echostr,
+                )
+                if decrypted.corp_id != str(app.get("corp_id") or ""):
+                    continue
+                return web.Response(text=decrypted.xml, content_type="text/plain")
+            except Exception:
+                continue
+        return web.Response(status=403, text="signature verification failed")
+
+    async def _handle_callback_post(self, request: Any) -> Any:
+        msg_signature = request.query.get("msg_signature", "")
+        timestamp = request.query.get("timestamp", "")
+        nonce = request.query.get("nonce", "")
+        body_bytes = await request.read()
+        if len(body_bytes) > MAX_CALLBACK_BODY_BYTES:
+            return web.Response(status=413, text="payload too large")
+        body = body_bytes.decode("utf-8", errors="replace")
+
+        for app in self._callback_apps:
+            try:
+                verified = decrypt_verified_callback_message(
+                    token=str(app.get("token") or ""),
+                    encoding_aes_key=str(app.get("encoding_aes_key") or ""),
+                    receive_id=str(app.get("corp_id") or ""),
+                    timestamp=timestamp,
+                    nonce=nonce,
+                    msg_signature=msg_signature,
+                    outer_xml=body,
+                )
+                event = await self._build_event_from_callback(app, verified.parsed)
+                if event is not None:
+                    if self._is_duplicate_callback(event.message_id):
+                        return web.Response(text="success", content_type="text/plain")
+                    task = asyncio.create_task(self._dispatch_event_to_hermes(event))
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                return web.Response(text="success", content_type="text/plain")
+            except ValueError:
+                continue
+            except Exception:
+                logger.exception("xwecom: callback POST handling failed")
+                break
+        return web.Response(status=400, text="invalid callback payload")
+
+    async def _build_event_from_callback(
+        self,
+        app: Dict[str, Any],
+        parsed: Optional[ParsedCallbackMessage],
+    ) -> Optional[MessageEvent]:
+        if parsed is None:
+            return None
+        text = parsed.text or ""
+        if not text and parsed.media_type:
+            text = f"[{parsed.media_type}消息]"
+        media_urls, media_types = await self._download_callback_media_if_any(
+            app,
+            parsed,
+        )
+        scoped_chat_id = self._callback_chat_key(
+            str(app.get("corp_id") or ""),
+            parsed.chat_id,
+        )
+        self._callback_chat_apps[scoped_chat_id] = str(app.get("name") or "")
+        self._callback_chat_apps[parsed.chat_id] = str(app.get("name") or "")
+
+        source = self.build_source(
+            chat_id=scoped_chat_id,
+            chat_name=parsed.chat_id,
+            chat_type="group" if parsed.is_group_chat else "dm",
+            user_id=parsed.sender_id,
+            user_name=parsed.sender_id,
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            message_id=parsed.msg_id,
+            media_urls=media_urls,
+            media_types=media_types,
+        )
+        if not hasattr(event, "metadata"):
+            event.metadata = {}
+        event.metadata["_xwecom_callback"] = {  # type: ignore[attr-defined]
+            "app": str(app.get("name") or ""),
+            "media_id": parsed.media_id,
+            "media_type": parsed.media_type,
+        }
+        return event
+
+    async def _download_callback_media_if_any(
+        self,
+        app: Dict[str, Any],
+        parsed: ParsedCallbackMessage,
+    ) -> Tuple[List[str], List[str]]:
+        if not parsed.media_id or not parsed.media_type:
+            return [], []
+        if cache_image_from_bytes is None or cache_document_from_bytes is None:
+            logger.warning("xwecom: callback media cache helpers unavailable")
+            return [], []
+        try:
+            token = await self._get_callback_access_token(app)
+            session = await self._ensure_callback_http_session()
+            async with session.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/media/get",
+                params={"access_token": token, "media_id": parsed.media_id},
+            ) as resp:
+                raw = await resp.read()
+                headers = getattr(resp, "headers", {}) or {}
+                status = getattr(resp, "status", 200)
+            if status >= 400:
+                logger.warning(
+                    "xwecom: callback media download failed status=%s media_id=%s",
+                    status,
+                    parsed.media_id,
+                )
+                return [], []
+            content_type = str(headers.get("content-type") or "").split(";", 1)[0].strip()
+            if content_type == "application/json":
+                logger.warning("xwecom: callback media download returned JSON error: %s", raw[:200])
+                return [], []
+            filename = self._filename_from_content_disposition(
+                str(headers.get("content-disposition") or "")
+            )
+            if not filename:
+                filename = self._callback_media_filename(
+                    parsed.media_id,
+                    parsed.media_type,
+                    content_type,
+                )
+            detected = detect_media_type(content_type, filename)
+            ok, final_type, error = check_file_size(raw, detected, filename)
+            if not ok:
+                logger.warning("xwecom: callback media rejected: %s", error)
+                return [], []
+            if final_type == "image":
+                ext = os.path.splitext(filename)[1] or self._extension_for_mime(
+                    content_type,
+                    ".jpg",
+                )
+                path = cache_image_from_bytes(raw, ext)
+                return [str(path)], [content_type or "image/jpeg"]
+            path = cache_document_from_bytes(raw, filename)
+            return [str(path)], [content_type or "application/octet-stream"]
+        except Exception as err:  # noqa: BLE001
+            logger.warning(
+                "xwecom: callback media download failed media_id=%s: %s",
+                parsed.media_id,
+                err,
+            )
+            return [], []
+
+    @staticmethod
+    def _filename_from_content_disposition(disposition: str) -> str:
+        if not disposition:
+            return ""
+        match = re.search(r"filename\*\s*=\s*UTF-8''([^;]+)", disposition, re.IGNORECASE)
+        if match:
+            return unquote(match.group(1).strip().strip('"'))
+        match = re.search(r'filename\s*=\s*"?([^";]+)"?', disposition, re.IGNORECASE)
+        if match:
+            return unquote(match.group(1).strip())
+        return ""
+
+    @staticmethod
+    def _extension_for_mime(content_type: str, fallback: str) -> str:
+        mapping = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+            "audio/amr": ".amr",
+            "video/mp4": ".mp4",
+            "application/pdf": ".pdf",
+            "text/plain": ".txt",
+        }
+        return mapping.get(content_type.lower(), fallback)
+
+    @classmethod
+    def _callback_media_filename(
+        cls,
+        media_id: str,
+        media_type: str,
+        content_type: str,
+    ) -> str:
+        ext = cls._extension_for_mime(
+            content_type,
+            ".jpg" if media_type == "image" else ".amr" if media_type == "voice" else ".bin",
+        )
+        return f"{media_id}{ext}"
+
+    def _is_duplicate_callback(self, msg_id: str) -> bool:
+        if not msg_id:
+            return False
+        now = time.time()
+        seen_at = self._callback_seen_messages.get(msg_id)
+        if seen_at is not None and now - seen_at < CALLBACK_MESSAGE_DEDUP_TTL_SECONDS:
+            return True
+        self._callback_seen_messages[msg_id] = now
+        if len(self._callback_seen_messages) > 2000:
+            cutoff = now - CALLBACK_MESSAGE_DEDUP_TTL_SECONDS
+            self._callback_seen_messages = {
+                key: ts for key, ts in self._callback_seen_messages.items() if ts > cutoff
+            }
+        return False
+
+    @staticmethod
+    def _callback_chat_key(corp_id: str, user_id: str) -> str:
+        return f"{corp_id}:{user_id}" if corp_id else user_id
+
+    def _get_callback_app_by_name(self, name: Optional[str]) -> Optional[Dict[str, Any]]:
+        if not name:
+            return None
+        for app in self._callback_apps:
+            if app.get("name") == name:
+                return app
+        return None
+
+    def _resolve_callback_app_for_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        app_name = self._callback_chat_apps.get(chat_id)
+        if not app_name and ":" not in chat_id:
+            matches = [
+                key for key in self._callback_chat_apps if key.endswith(f":{chat_id}")
+            ]
+            if len(matches) == 1:
+                app_name = self._callback_chat_apps.get(matches[0])
+        return self._get_callback_app_by_name(app_name)
+
+    async def _send_callback_text(
+        self,
+        app: Dict[str, Any],
+        chat_id: str,
+        content: str,
+    ) -> SendResult:
+        if web is None or ClientSession is None:
+            return SendResult(success=False, error="aiohttp is required for callback send")
+        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
+        payload = {
+            "touser": touser,
+            "msgtype": "text",
+            "agentid": int(str(app.get("agent_id") or 0)),
+            "text": {"content": content[:2048]},
+            "safe": 0,
+        }
+        try:
+            for attempt in range(2):
+                token = await self._get_callback_access_token(app)
+                session = await self._ensure_callback_http_session()
+                async with session.post(
+                    "https://qyapi.weixin.qq.com/cgi-bin/message/send",
+                    params={"access_token": token},
+                    json=payload,
+                ) as resp:
+                    data = await resp.json(content_type=None)
+                errcode = data.get("errcode")
+                if errcode in {40001, 42001} and attempt == 0:
+                    self._callback_access_tokens.pop(str(app.get("name") or ""), None)
+                    continue
+                if errcode != 0:
+                    return SendResult(success=False, error=str(data), raw_response=data)
+                return SendResult(
+                    success=True,
+                    message_id=str(data.get("msgid") or ""),
+                    raw_response=data,
+                )
+            return SendResult(success=False, error="callback send failed after token refresh")
+        except Exception as err:  # noqa: BLE001
+            return SendResult(success=False, error=str(err))
+
+    async def _ensure_callback_http_session(self) -> Any:
+        if self._callback_http_session is None or self._callback_http_session.closed:
+            self._callback_http_session = ClientSession()
+        return self._callback_http_session
+
+    async def _get_callback_access_token(self, app: Dict[str, Any]) -> str:
+        name = str(app.get("name") or "")
+        cached = self._callback_access_tokens.get(name)
+        now = time.time()
+        if cached and cached.get("expires_at", 0) > now + 60:
+            return str(cached["token"])
+        if not app.get("corp_secret"):
+            raise RuntimeError("corp_secret is required for callback proactive send")
+        session = await self._ensure_callback_http_session()
+        async with session.get(
+            "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+            params={
+                "corpid": app.get("corp_id"),
+                "corpsecret": app.get("corp_secret"),
+            },
+        ) as resp:
+            data = await resp.json(content_type=None)
+        if data.get("errcode") != 0:
+            raise RuntimeError(f"WeCom token refresh failed: {data}")
+        token = str(data["access_token"])
+        expires_in = int(data.get("expires_in", ACCESS_TOKEN_TTL_SECONDS))
+        self._callback_access_tokens[name] = {
+            "token": token,
+            "expires_at": time.time() + expires_in,
+        }
+        return token
 
     # ── Message parsing ─────────────────────────────────────────────────────
 
@@ -647,15 +1470,21 @@ class XWeComAdapter(BasePlatformAdapter):
         if turn.expired or turn.finalized:
             return False
 
+        turn_text = self._turn_visible_text(turn, text)
+
         # ── Seed frame ──────────────────────────────────────────────────
         if not turn.seeded:
-            ok = await self._send_stream_reply_frame(turn, THINKING_MESSAGE, finish=False)
+            ok = await self._send_stream_reply_frame(
+                turn, THINKING_MESSAGE, finish=False, allow_skip=False
+            )
             if not ok:
                 self._cleanup_stream_turn(turn_key, turn)
                 return False
             turn.seeded = True
+            self._schedule_stream_rotation(turn, turn_key=turn_key, turn_id=turn_id)
+            self._schedule_stream_keepalive(turn, turn_id=turn_id)
             # Consumer's explicit seed: empty text, not finalizing — done.
-            if not text and not finalize:
+            if not turn_text and not finalize:
                 return True
 
         # ── Finalize path ───────────────────────────────────────────────
@@ -663,18 +1492,20 @@ class XWeComAdapter(BasePlatformAdapter):
             self._cancel_idle_flush(turn)
             # Drain the chunker so the final frame carries the latest tail.
             if turn.chunker is not None:
-                drained = turn.chunker.drain(text)
+                drained = turn.chunker.drain(turn_text)
                 if drained is not None:
-                    text = drained
+                    turn_text = drained
 
-            final_text = text or ""
+            final_text = turn_text or ""
             # WeCom silently drops a final frame whose content matches the
             # last intermediate frame.  Append a zero-width space to force
             # a content diff and make sure the bubble closes.
             if final_text and final_text == turn.last_sent_content:
                 final_text = final_text + "​"
 
-            ok = await self._send_stream_reply_frame(turn, final_text, finish=True)
+            ok = await self._send_stream_reply_frame(
+                turn, final_text, finish=True, allow_skip=False
+            )
             turn.finalized = True
             self._cleanup_stream_turn(turn_key, turn)
             # Final-frame ack timeout is non-fatal — WeCom usually already
@@ -685,21 +1516,21 @@ class XWeComAdapter(BasePlatformAdapter):
         # ── Intermediate frame via the block chunker ────────────────────
         if turn.chunker is None:
             turn.chunker = BlockChunker()
-        turn.pending_cumulative = text
+        turn.pending_cumulative = turn_text
 
         if turn.frame_count >= MAX_INTERMEDIATE_FRAMES:
             # Frame cap reached — keep accumulating silently. The finalize
             # frame will carry the rest.
             return True
 
-        if turn.chunker.should_emit(text):
+        if turn.chunker.should_emit(turn_text):
             self._cancel_idle_flush(turn)
-            ok = await self._send_stream_reply_frame(turn, text, finish=False)
+            ok = await self._send_stream_reply_frame(turn, turn_text, finish=False)
             if not ok:
                 return False
-            turn.chunker.mark_emitted(text)
+            turn.chunker.mark_emitted(turn_text)
             turn.frame_count += 1
-            turn.last_sent_content = text
+            turn.last_sent_content = turn_text
             return True
 
         # Not ready to emit yet — arm idle flush so a quiet LLM still
@@ -728,12 +1559,177 @@ class XWeComAdapter(BasePlatformAdapter):
         frame = self._last_chat_frames.get(chat)
         return req_id, frame
 
+    @staticmethod
+    def _turn_visible_text(turn: StreamTurn, cumulative_text: str) -> str:
+        """Return the content segment that belongs to the current stream id.
+
+        Aligned with openclaw-plugin-wecom stream rotation: once a stream is
+        rotated, the new stream should show only content generated after the
+        rotation point, avoiding duplicate old text in the new bubble.
+        """
+        text = cumulative_text or ""
+        if turn.base_cumulative_len <= 0:
+            return text
+        if len(text) <= turn.base_cumulative_len:
+            return ""
+        return text[turn.base_cumulative_len :]
+
+    def _schedule_stream_keepalive(
+        self,
+        turn: StreamTurn,
+        *,
+        turn_id: Optional[str],
+    ) -> None:
+        self._cancel_keepalive(turn)
+        if turn.finalized or turn.expired:
+            return
+        if self._stream_keepalive_interval_s <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        turn.keepalive_handle = loop.call_later(
+            self._stream_keepalive_interval_s,
+            self._on_keepalive_fire,
+            turn,
+            turn_id,
+        )
+
+    def _on_keepalive_fire(
+        self,
+        turn: StreamTurn,
+        turn_id: Optional[str],
+    ) -> None:
+        turn.keepalive_handle = None
+        if turn.finalized or turn.expired:
+            return
+        try:
+            asyncio.ensure_future(self._send_keepalive(turn, turn_id))
+        except RuntimeError:
+            pass
+
+    async def _send_keepalive(
+        self,
+        turn: StreamTurn,
+        turn_id: Optional[str],
+    ) -> None:
+        if turn.finalized or turn.expired:
+            return
+        if turn.frame_count >= MAX_INTERMEDIATE_FRAMES:
+            return
+        content = turn.pending_cumulative or turn.last_wire_content or THINKING_MESSAGE
+        ok = await self._send_stream_reply_frame(turn, content, finish=False)
+        if ok:
+            turn.frame_count += 1
+            if content:
+                turn.last_sent_content = content
+                if turn.chunker is not None:
+                    turn.chunker.mark_emitted(content)
+        self._schedule_stream_keepalive(turn, turn_id=turn_id)
+
+    def _schedule_stream_rotation(
+        self,
+        turn: StreamTurn,
+        *,
+        turn_key: str,
+        turn_id: Optional[str],
+    ) -> None:
+        self._cancel_rotation(turn)
+        if turn.finalized or turn.expired:
+            return
+        if self._stream_rotate_after_s <= 0:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        turn.rotation_handle = loop.call_later(
+            self._stream_rotate_after_s,
+            self._on_rotation_fire,
+            turn_key,
+            turn,
+            turn_id,
+        )
+
+    def _on_rotation_fire(
+        self,
+        turn_key: str,
+        turn: StreamTurn,
+        turn_id: Optional[str],
+    ) -> None:
+        turn.rotation_handle = None
+        if turn.finalized or turn.expired:
+            return
+        try:
+            asyncio.ensure_future(self._rotate_stream(turn_key, turn, turn_id))
+        except RuntimeError:
+            pass
+
+    async def _rotate_stream(
+        self,
+        turn_key: str,
+        turn: StreamTurn,
+        turn_id: Optional[str],
+    ) -> None:
+        """Finish the current stream and continue with a fresh stream id.
+
+        Aligned with openclaw-plugin-wecom ws-monitor.js:rotateStream.
+        """
+        if turn.finalized or turn.expired:
+            return
+
+        self._cancel_idle_flush(turn)
+        self._cancel_keepalive(turn)
+
+        old_stream_id = turn.stream_id
+        current_content = turn.pending_cumulative or turn.last_sent_content
+        finish_content = current_content or "处理中..."
+        await self._send_stream_reply_frame(
+            turn,
+            finish_content,
+            finish=True,
+            allow_skip=False,
+            process_template_cards=False,
+        )
+
+        turn.stream_id = f"stream_{uuid.uuid4().hex[:12]}"
+        turn.chunker = BlockChunker()
+        turn.frame_count = 0
+        turn.last_sent_content = ""
+        turn.last_wire_content = THINKING_MESSAGE
+        turn.base_cumulative_len += len(current_content)
+        turn.pending_cumulative = ""
+        turn.start_time = time.monotonic()
+        logger.info(
+            "xwecom: rotated stream for chat %s old=%s new=%s",
+            turn.chat_id,
+            old_stream_id,
+            turn.stream_id,
+        )
+
+        ok = await self._send_stream_reply_frame(
+            turn,
+            THINKING_MESSAGE,
+            finish=False,
+            allow_skip=False,
+        )
+        if not ok:
+            turn.expired = True
+            self._stream_expired_chats.add(turn.chat_id)
+            self._cleanup_stream_turn(turn_key, turn)
+            return
+        self._schedule_stream_rotation(turn, turn_key=turn_key, turn_id=turn_id)
+        self._schedule_stream_keepalive(turn, turn_id=turn_id)
+
     async def _send_stream_reply_frame(
         self,
         turn: StreamTurn,
         content: str,
         *,
         finish: bool,
+        allow_skip: bool = True,
+        process_template_cards: bool = True,
     ) -> bool:
         """Wire-level frame send. Truncates to MAX_STREAM_CONTENT_LENGTH,
         translates errcode 846608 into an expired turn, and treats ack
@@ -743,11 +1739,45 @@ class XWeComAdapter(BasePlatformAdapter):
             return False
 
         # Truncate by UTF-8 byte length — WeCom rejects frames over 20KB.
-        truncated = self._truncate_to_bytes(content or "", MAX_STREAM_CONTENT_LENGTH)
-        if len(truncated) != len(content or ""):
+        outbound_content = content or ""
+        if finish and process_template_cards:
+            try:
+                card_result = await process_template_cards_if_needed(
+                    self._client,
+                    turn.frame,
+                    accumulated_text=outbound_content,
+                    account_id=self._account_id,
+                    cache=self._template_card_cache,
+                )
+                if card_result is not None:
+                    outbound_content = card_result.remaining_text
+            except Exception as err:  # noqa: BLE001
+                logger.warning("xwecom: final template card send failed: %s", err)
+            outbound_content = await self._process_reply_media_directives(
+                turn.chat_id,
+                outbound_content,
+            )
+        else:
+            outbound_content = mask_template_card_blocks(outbound_content)
+
+        outbound_was_truncated = (
+            len(outbound_content.encode("utf-8")) > MAX_STREAM_CONTENT_LENGTH
+        )
+        truncated = self._truncate_to_bytes(outbound_content, MAX_STREAM_CONTENT_LENGTH)
+        if outbound_was_truncated:
             logger.warning(
                 "xwecom: stream content truncated for stream_id=%s", turn.stream_id,
             )
+
+        acquired = True
+        if allow_skip:
+            acquired = await self._stream_gate.try_acquire(turn.stream_id, finish=finish)
+            if not acquired:
+                logger.debug(
+                    "xwecom: stream %s skipped intermediate frame; ack pending",
+                    turn.stream_id,
+                )
+                return True
 
         try:
             resp = await self._client.reply_stream(
@@ -777,6 +1807,9 @@ class XWeComAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("xwecom: stream send raised: %s", exc)
             return False
+        finally:
+            if acquired and allow_skip:
+                await self._stream_gate.release(turn.stream_id)
 
         errcode = self._extract_errcode(resp)
         if errcode == STREAM_EXPIRED_ERRCODE:
@@ -800,6 +1833,16 @@ class XWeComAdapter(BasePlatformAdapter):
             "xwecom: stream %s frame sent (finish=%s, len=%d)",
             turn.stream_id, finish, len(truncated),
         )
+        if truncated:
+            turn.last_wire_content = truncated
+        if finish:
+            await self._stream_gate.clear(turn.stream_id)
+            if (
+                process_template_cards
+                and outbound_was_truncated
+                and not turn.full_content_fallback_sent
+            ):
+                await self._send_full_content_fallback(turn, outbound_content)
         return True
 
     @staticmethod
@@ -837,8 +1880,145 @@ class XWeComAdapter(BasePlatformAdapter):
             i += 1
         return cut[i:].decode("utf-8", errors="ignore")
 
+    @staticmethod
+    def _split_text_by_byte_limit(text: str, max_bytes: int) -> List[str]:
+        """Split text into UTF-8 byte-limited chunks.
+
+        Aligned with openclaw-plugin-wecom utils.ts:splitTextByByteLimit.
+        """
+        if not text:
+            return []
+        if len(text.encode("utf-8")) <= max_bytes:
+            return [text]
+
+        chunks: List[str] = []
+        remaining = text
+        while remaining:
+            if len(remaining.encode("utf-8")) <= max_bytes:
+                chunks.append(remaining)
+                break
+
+            lo = 0
+            hi = len(remaining)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if len(remaining[:mid].encode("utf-8")) <= max_bytes:
+                    lo = mid
+                else:
+                    hi = mid - 1
+
+            split_at = lo
+            search_start = max(0, int(split_at * 0.8))
+            last_newline = remaining.rfind("\n", 0, split_at)
+            if last_newline >= search_start:
+                split_at = last_newline + 1
+            if split_at <= 0:
+                split_at = max(1, lo)
+
+            chunks.append(remaining[:split_at])
+            remaining = remaining[split_at:]
+        return chunks
+
+    @staticmethod
+    def _split_reply_media_from_text(text: str) -> Tuple[str, List[str]]:
+        """Extract MEDIA:/FILE: directive lines from reply text.
+
+        Aligned with openclaw-plugin-wecom ws-monitor.js:splitReplyMediaFromText.
+        """
+        if not text:
+            return "", []
+
+        media_urls: List[str] = []
+        kept_lines: List[str] = []
+        for line in text.split("\n"):
+            match = REPLY_MEDIA_DIRECTIVE_RE.match(line)
+            if not match:
+                kept_lines.append(line)
+                continue
+            media_url = match.group(1).strip()
+            if len(media_url) >= 2 and media_url[0] == "`" and media_url[-1] == "`":
+                media_url = media_url[1:-1].strip()
+            if media_url:
+                media_urls.append(media_url)
+
+        visible = re.sub(r"\n{3,}", "\n\n", "\n".join(kept_lines)).strip()
+        return visible, media_urls
+
+    async def _process_reply_media_directives(
+        self,
+        chat_id: str,
+        text: str,
+    ) -> str:
+        """Upload/send reply media directives and return visible text only."""
+        if not self._client:
+            return text
+        visible, media_urls = self._split_reply_media_from_text(text)
+        if not media_urls:
+            return visible
+
+        failure_notes: List[str] = []
+        for media_url in media_urls:
+            result = await upload_and_send_media(
+                self._client,
+                media_url,
+                chat_id,
+            )
+            if result.ok:
+                continue
+            reason = (
+                getattr(result, "reject_reason", None)
+                or getattr(result, "error", None)
+                or "unknown error"
+            )
+            failure_notes.append(f"文件发送失败：{media_url}\n{reason}")
+
+        if failure_notes:
+            suffix = "\n\n".join(failure_notes)
+            return f"{visible}\n\n{suffix}".strip() if visible else suffix
+        return visible
+
+    async def _send_full_content_fallback(
+        self,
+        turn: StreamTurn,
+        full_content: str,
+    ) -> None:
+        """Proactively send full text when final stream content was truncated.
+
+        Aligned with OpenClaw's dmContent/full-text fallback intent, adapted to
+        Hermes' AI Bot WS path by using proactive send_message on the same chat.
+        """
+        if not self._client:
+            return
+        chat_id = (turn.frame.get("body") or {}).get("chatid") or turn.chat_id
+        if not chat_id:
+            return
+        turn.full_content_fallback_sent = True
+        chunks = self._split_text_by_byte_limit(full_content, MAX_MESSAGE_LENGTH)
+        if not chunks:
+            return
+        header = (
+            "上方流式气泡因企业微信单帧长度限制只显示了最新部分，"
+            "以下为完整回复：\n\n"
+        )
+        for idx, chunk in enumerate(chunks):
+            content = f"{header}{chunk}" if idx == 0 else chunk
+            try:
+                await self._client.send_message(
+                    chat_id,
+                    {"msgtype": "markdown", "markdown": {"content": content}},
+                )
+            except Exception as err:  # noqa: BLE001
+                logger.warning(
+                    "xwecom: full-content fallback send failed for stream %s: %s",
+                    turn.stream_id,
+                    err,
+                )
+                return
+
     def _cleanup_stream_turn(self, turn_key: str, turn: StreamTurn) -> None:
         self._cancel_idle_flush(turn)
+        self._cancel_keepalive(turn)
+        self._cancel_rotation(turn)
         self._stream_turns.pop(turn_key, None)
 
     # ── Idle flush ──────────────────────────────────────────────────────────
@@ -851,6 +2031,24 @@ class XWeComAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             turn.idle_flush_handle = None
+
+    def _cancel_keepalive(self, turn: StreamTurn) -> None:
+        handle = turn.keepalive_handle
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception:
+                pass
+            turn.keepalive_handle = None
+
+    def _cancel_rotation(self, turn: StreamTurn) -> None:
+        handle = turn.rotation_handle
+        if handle is not None:
+            try:
+                handle.cancel()
+            except Exception:
+                pass
+            turn.rotation_handle = None
 
     def _arm_idle_flush(
         self,
@@ -982,19 +2180,53 @@ def validate_config(config: Any) -> bool:
     extra = getattr(config, "extra", {}) or {}
     bot_id = os.getenv("XWECOM_BOT_ID") or extra.get("bot_id")
     secret = os.getenv("XWECOM_SECRET") or extra.get("secret")
-    return bool(bot_id and secret)
+    if bot_id and secret:
+        return True
+    callback_enabled = XWeComAdapter._truthy(
+        extra.get("callback_enabled") or os.getenv("XWECOM_CALLBACK_ENABLED")
+    )
+    if not callback_enabled:
+        return False
+    return bool(
+        (extra.get("corp_id") or os.getenv("XWECOM_CORP_ID"))
+        and (
+            extra.get("callback_token")
+            or extra.get("token")
+            or os.getenv("XWECOM_CALLBACK_TOKEN")
+        )
+        and (extra.get("encoding_aes_key") or os.getenv("XWECOM_ENCODING_AES_KEY"))
+    )
 
 
 def _env_enablement() -> Optional[Dict[str, Any]]:
     """Seed PlatformConfig.extra from env vars."""
     bot_id = os.getenv("XWECOM_BOT_ID", "").strip()
     secret = os.getenv("XWECOM_SECRET", "").strip()
-    if not (bot_id and secret):
+    callback_enabled = XWeComAdapter._truthy(os.getenv("XWECOM_CALLBACK_ENABLED"))
+    if not (bot_id and secret) and not callback_enabled:
         return None
-    seed: Dict[str, Any] = {"bot_id": bot_id, "secret": secret}
+    seed: Dict[str, Any] = {}
+    if bot_id and secret:
+        seed.update({"bot_id": bot_id, "secret": secret})
     ws_url = os.getenv("XWECOM_WEBSOCKET_URL")
     if ws_url:
         seed["websocket_url"] = ws_url
+    if callback_enabled:
+        seed["callback_enabled"] = True
+        env_map = {
+            "callback_host": "XWECOM_CALLBACK_HOST",
+            "callback_port": "XWECOM_CALLBACK_PORT",
+            "callback_path": "XWECOM_CALLBACK_PATH",
+            "corp_id": "XWECOM_CORP_ID",
+            "corp_secret": "XWECOM_CORP_SECRET",
+            "agent_id": "XWECOM_AGENT_ID",
+            "callback_token": "XWECOM_CALLBACK_TOKEN",
+            "encoding_aes_key": "XWECOM_ENCODING_AES_KEY",
+        }
+        for key, env_name in env_map.items():
+            value = os.getenv(env_name)
+            if value:
+                seed[key] = value
     home = os.getenv("XWECOM_HOME_CHANNEL")
     if home:
         seed["home_channel"] = {
