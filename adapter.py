@@ -2205,6 +2205,8 @@ def validate_config(config: Any) -> bool:
     secret = os.getenv("XWECOM_SECRET") or extra.get("secret")
     if bot_id and secret:
         return True
+    if _standalone_agent_app(extra) is not None:
+        return True
     callback_enabled = XWeComAdapter._truthy(
         extra.get("callback_enabled") or os.getenv("XWECOM_CALLBACK_ENABLED")
     )
@@ -2226,7 +2228,13 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     bot_id = os.getenv("XWECOM_BOT_ID", "").strip()
     secret = os.getenv("XWECOM_SECRET", "").strip()
     callback_enabled = XWeComAdapter._truthy(os.getenv("XWECOM_CALLBACK_ENABLED"))
-    if not (bot_id and secret) and not callback_enabled:
+    agent_env = {
+        "corp_id": os.getenv("XWECOM_CORP_ID", "").strip(),
+        "corp_secret": os.getenv("XWECOM_CORP_SECRET", "").strip(),
+        "agent_id": os.getenv("XWECOM_AGENT_ID", "").strip(),
+    }
+    has_agent_outbound = all(agent_env.values())
+    if not (bot_id and secret) and not callback_enabled and not has_agent_outbound:
         return None
     seed: Dict[str, Any] = {}
     if bot_id and secret:
@@ -2234,6 +2242,8 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     ws_url = os.getenv("XWECOM_WEBSOCKET_URL")
     if ws_url:
         seed["websocket_url"] = ws_url
+    if has_agent_outbound:
+        seed.update(agent_env)
     if callback_enabled:
         seed["callback_enabled"] = True
         env_map = {
@@ -2259,6 +2269,120 @@ def _env_enablement() -> Optional[Dict[str, Any]]:
     return seed
 
 
+def _standalone_agent_app(extra: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the first app configured for Agent HTTP outbound delivery."""
+    for app in XWeComAdapter._normalize_callback_apps(extra):
+        if app.get("corp_id") and app.get("corp_secret") and app.get("agent_id"):
+            return app
+    return None
+
+
+def _resolve_wecom_target(raw: str) -> Optional[Dict[str, str]]:
+    """Resolve OpenClaw-style WeCom outbound targets."""
+    clean = str(raw or "").strip()
+    if not clean:
+        return None
+    clean = re.sub(
+        r"^(wecom-agent|xwecom|wecom|wechatwork|wework|qywx):",
+        "",
+        clean,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    prefix_map = {
+        "party": "toparty",
+        "dept": "toparty",
+        "tag": "totag",
+        "group": "chatid",
+        "chat": "chatid",
+        "appchat": "chatid",
+        "user": "touser",
+    }
+    for prefix, field in prefix_map.items():
+        marker = f"{prefix}:"
+        if clean.lower().startswith(marker):
+            value = clean[len(marker):].strip()
+            return {field: value} if value else None
+
+    if re.match(r"^(wr|wc)", clean, re.IGNORECASE):
+        return {"chatid": clean}
+    if clean.isdigit():
+        return {"toparty": clean}
+    return {"touser": clean}
+
+
+async def _standalone_send_agent(
+    app: Dict[str, Any],
+    chat_id: str,
+    message: str,
+) -> Dict[str, Any]:
+    """Send a standalone message through WeCom Agent HTTP API."""
+    if ClientSession is None:
+        return {"error": "aiohttp is required for Agent HTTP send"}
+    target = _resolve_wecom_target(chat_id)
+    if target is None:
+        return {"error": f"Cannot resolve xwecom target from {chat_id!r}"}
+
+    try:
+        async with ClientSession() as session:
+            async with session.get(
+                "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
+                params={
+                    "corpid": app.get("corp_id"),
+                    "corpsecret": app.get("corp_secret"),
+                },
+            ) as resp:
+                token_data = await resp.json(content_type=None)
+            if token_data.get("errcode") != 0:
+                return {"error": f"Agent token refresh failed: {token_data}"}
+            token = str(token_data["access_token"])
+
+            if target.get("chatid"):
+                url = "https://qyapi.weixin.qq.com/cgi-bin/appchat/send"
+                payload = {
+                    "chatid": target["chatid"],
+                    "msgtype": "text",
+                    "text": {"content": message[:2048]},
+                }
+            else:
+                url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+                payload = {
+                    key: value
+                    for key, value in {
+                        "touser": target.get("touser"),
+                        "toparty": target.get("toparty"),
+                        "totag": target.get("totag"),
+                    }.items()
+                    if value
+                }
+                payload.update(
+                    {
+                        "msgtype": "text",
+                        "agentid": int(str(app.get("agent_id") or 0)),
+                        "text": {"content": message[:2048]},
+                        "safe": 0,
+                    }
+                )
+
+            async with session.post(
+                url,
+                params={"access_token": token},
+                json=payload,
+            ) as resp:
+                send_data = await resp.json(content_type=None)
+            if send_data.get("errcode") != 0:
+                return {"error": f"Agent send failed: {send_data}"}
+            message_id = str(send_data.get("msgid") or f"agent_{int(time.time())}")
+            return {
+                "success": True,
+                "message_id": message_id,
+                "raw_response": send_data,
+                "transport": "agent_http",
+            }
+    except Exception as err:  # noqa: BLE001
+        return {"error": f"Agent send failed: {err}"}
+
+
 async def _standalone_send(
     pconfig: Any,
     chat_id: str,
@@ -2270,6 +2394,10 @@ async def _standalone_send(
 ) -> Dict[str, Any]:
     """Standalone sender for out-of-process cron delivery."""
     extra = getattr(pconfig, "extra", {}) or {}
+    agent_app = _standalone_agent_app(extra)
+    if agent_app is not None:
+        return await _standalone_send_agent(agent_app, chat_id, message)
+
     bot_id = extra.get("bot_id") or os.getenv("XWECOM_BOT_ID", "")
     secret = extra.get("secret") or os.getenv("XWECOM_SECRET", "")
     ws_url = extra.get("websocket_url") or os.getenv(
@@ -2277,7 +2405,12 @@ async def _standalone_send(
     )
 
     if not (bot_id and secret):
-        return {"error": "XWECOM_BOT_ID and XWECOM_SECRET required"}
+        return {
+            "error": (
+                "XWECOM_CORP_ID/XWECOM_CORP_SECRET/XWECOM_AGENT_ID or "
+                "XWECOM_BOT_ID/XWECOM_SECRET required"
+            )
+        }
 
     lock_acquired = False
     if acquire_scoped_lock is not None:

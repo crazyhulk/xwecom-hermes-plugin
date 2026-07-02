@@ -422,6 +422,22 @@ class TestPluginRegistration:
             config.extra = {}
             assert validate_config(config) is True
 
+    def test_validate_config_with_agent_outbound_env(self):
+        from adapter import validate_config
+
+        with patch.dict(
+            os.environ,
+            {
+                "XWECOM_CORP_ID": "wxCORP",
+                "XWECOM_CORP_SECRET": "secret",
+                "XWECOM_AGENT_ID": "1000002",
+            },
+            clear=True,
+        ):
+            config = MagicMock()
+            config.extra = {}
+            assert validate_config(config) is True
+
     def test_validate_config_without_env(self):
         from adapter import validate_config
 
@@ -451,6 +467,26 @@ class TestPluginRegistration:
             assert result["secret"] == "secret_456"
             assert result["home_channel"]["chat_id"] == "chat_789"
 
+    def test_env_enablement_with_agent_outbound_vars(self):
+        from adapter import _env_enablement
+
+        with patch.dict(
+            os.environ,
+            {
+                "XWECOM_CORP_ID": "wxCORP",
+                "XWECOM_CORP_SECRET": "secret",
+                "XWECOM_AGENT_ID": "1000002",
+            },
+            clear=True,
+        ):
+            result = _env_enablement()
+
+        assert result is not None
+        assert result["corp_id"] == "wxCORP"
+        assert result["corp_secret"] == "secret"
+        assert result["agent_id"] == "1000002"
+        assert "callback_enabled" not in result
+
     def test_env_enablement_without_vars(self):
         from adapter import _env_enablement
 
@@ -477,6 +513,74 @@ class TestPluginRegistration:
         assert kwargs["standalone_sender_fn"] is not None
         assert kwargs["allowed_users_env"] == "XWECOM_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "XWECOM_ALLOW_ALL_USERS"
+
+    def test_resolve_wecom_target(self):
+        from adapter import _resolve_wecom_target
+
+        assert _resolve_wecom_target("wecom:user:alice") == {"touser": "alice"}
+        assert _resolve_wecom_target("party:1") == {"toparty": "1"}
+        assert _resolve_wecom_target("tag:2") == {"totag": "2"}
+        assert _resolve_wecom_target("chat:wr123") == {"chatid": "wr123"}
+        assert _resolve_wecom_target("wc123") == {"chatid": "wc123"}
+        assert _resolve_wecom_target("123") == {"toparty": "123"}
+        assert _resolve_wecom_target("alice") == {"touser": "alice"}
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_prefers_agent_http(self):
+        from adapter import _standalone_send
+
+        config = MagicMock()
+        config.extra = {
+            "bot_id": "bot_123",
+            "secret": "secret_456",
+            "corp_id": "wxCORP",
+            "corp_secret": "agent_secret",
+            "agent_id": "1000002",
+        }
+        post_calls = []
+
+        class FakeResponse:
+            def __init__(self, data):
+                self._data = data
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self, content_type=None):
+                return self._data
+
+        class FakeSession:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def get(self, url, **kwargs):
+                return FakeResponse({"errcode": 0, "access_token": "ACCESS"})
+
+            def post(self, url, **kwargs):
+                post_calls.append((url, kwargs))
+                return FakeResponse({"errcode": 0, "msgid": "MSG1"})
+
+        with (
+            patch("adapter.ClientSession", return_value=FakeSession()),
+            patch("adapter.acquire_scoped_lock") as acquire_lock,
+            patch("adapter.WSClient") as ws_client,
+        ):
+            result = await _standalone_send(config, "user:alice", "hello")
+
+        assert result["success"] is True
+        assert result["message_id"] == "MSG1"
+        assert result["transport"] == "agent_http"
+        assert post_calls[0][0].endswith("/cgi-bin/message/send")
+        assert post_calls[0][1]["json"]["touser"] == "alice"
+        assert post_calls[0][1]["json"]["agentid"] == 1000002
+        acquire_lock.assert_not_called()
+        ws_client.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_standalone_send_refuses_when_scoped_lock_is_held(self):
