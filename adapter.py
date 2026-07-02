@@ -1897,6 +1897,8 @@ class XWeComAdapter(BasePlatformAdapter):
                 turn.chat_id,
                 outbound_content,
             )
+            if not outbound_content.strip():
+                outbound_content = "已完成。"
         else:
             outbound_content = mask_template_card_blocks(outbound_content)
 

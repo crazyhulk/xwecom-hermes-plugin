@@ -280,6 +280,34 @@ class TestAdapterReplyMediaDirectives:
         assert "文件发送失败" in final_content
         assert "missing file" in final_content
 
+    @pytest.mark.asyncio
+    async def test_stream_final_media_only_closes_with_non_empty_content(self):
+        adapter = _make_adapter()
+        frame = {
+            "headers": {"req_id": "REQ1"},
+            "body": {"chatid": "chat1", "from": {"userid": "alice"}},
+        }
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+        adapter._last_chat_req_ids["chat1"] = "REQ1"
+        adapter._last_chat_frames["chat1"] = frame
+
+        async def fake_upload(client, media_url, chat_id, **kwargs):
+            return SimpleNamespace(ok=True)
+
+        await adapter.send_stream_frame("", chat_id="chat1")
+        with patch("adapter.upload_and_send_media", side_effect=fake_upload):
+            await adapter.send_stream_frame(
+                "MEDIA:/tmp/ok.log",
+                chat_id="chat1",
+                finalize=True,
+            )
+
+        final_content = adapter._client.reply_stream.await_args.args[2]
+        final_finish = adapter._client.reply_stream.await_args.args[3]
+        assert final_finish is True
+        assert final_content == "已完成。"
+
 
 class TestAdapterCallbackInbound:
     @pytest.mark.asyncio
