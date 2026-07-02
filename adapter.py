@@ -285,6 +285,10 @@ class XWeComAdapter(BasePlatformAdapter):
         self._stream_rotate_after_s = float(
             extra.get("stream_rotate_after_s", STREAM_ROTATE_AFTER_SECONDS)
         )
+        self._reply_ack_timeout_s = float(
+            extra.get("reply_ack_timeout_s")
+            or os.getenv("XWECOM_REPLY_ACK_TIMEOUT_S", "30")
+        )
         self._text_batch_delay_s = float(
             extra.get("text_batch_delay_s", TEXT_BATCH_DELAY_SECONDS)
         )
@@ -486,7 +490,7 @@ class XWeComAdapter(BasePlatformAdapter):
             ws_url=self._ws_url,
             heartbeat_interval=30000,
             max_reconnect_attempts=-1,  # Infinite reconnection
-            reply_ack_timeout=5.0,
+            reply_ack_timeout=self._reply_ack_timeout_s,
         )
         self._client = WSClient(opts)
 

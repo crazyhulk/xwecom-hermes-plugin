@@ -380,6 +380,22 @@ class TestXWeComAdapterParsing:
         assert XWeComAdapter._coerce_list(["x", "y"]) == ["x", "y"]
         assert XWeComAdapter._coerce_list("single") == ["single"]
 
+    def test_adapter_reply_ack_timeout_defaults_to_30s(self):
+        from adapter import XWeComAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = XWeComAdapter(PlatformConfig(extra={}))
+
+        assert adapter._reply_ack_timeout_s == 30.0
+
+    def test_adapter_reply_ack_timeout_can_be_configured(self):
+        from adapter import XWeComAdapter
+        from gateway.config import PlatformConfig
+
+        adapter = XWeComAdapter(PlatformConfig(extra={"reply_ack_timeout_s": 45}))
+
+        assert adapter._reply_ack_timeout_s == 45.0
+
     def test_interpret_scoped_lock_result_supports_legacy_bool(self):
         from adapter import XWeComAdapter
 
