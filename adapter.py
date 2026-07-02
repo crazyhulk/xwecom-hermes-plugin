@@ -29,9 +29,10 @@ from gateway.platforms.base import (
 )
 
 try:
-    from aiohttp import ClientSession, web
+    from aiohttp import ClientSession, FormData, web
 except ImportError:
     ClientSession = None  # type: ignore[assignment]
+    FormData = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
 try:
@@ -74,6 +75,8 @@ try:
         check_file_size,
         detect_media_type,
         download_and_decrypt,
+        apply_file_size_limits,
+        resolve_media_file,
         upload_and_send_media,
         upload_media_chunked,
     )
@@ -116,6 +119,8 @@ except ImportError:
         check_file_size,
         detect_media_type,
         download_and_decrypt,
+        apply_file_size_limits,
+        resolve_media_file,
         upload_and_send_media,
         upload_media_chunked,
     )
@@ -417,6 +422,10 @@ class XWeComAdapter(BasePlatformAdapter):
             and app.get("token")
             and app.get("encoding_aes_key")
         )
+
+    @staticmethod
+    def _agent_app_configured(app: Dict[str, Any]) -> bool:
+        return bool(app.get("corp_id") and app.get("corp_secret") and app.get("agent_id"))
 
     @staticmethod
     def _interpret_scoped_lock_result(
@@ -1272,6 +1281,15 @@ class XWeComAdapter(BasePlatformAdapter):
                 app_name = self._callback_chat_apps.get(matches[0])
         return self._get_callback_app_by_name(app_name)
 
+    def _resolve_agent_app_for_chat(self, chat_id: str) -> Optional[Dict[str, Any]]:
+        callback_app = self._resolve_callback_app_for_chat(chat_id)
+        if callback_app is not None and self._agent_app_configured(callback_app):
+            return callback_app
+        for app in self._callback_apps:
+            if self._agent_app_configured(app):
+                return app
+        return None
+
     async def _send_callback_text(
         self,
         app: Dict[str, Any],
@@ -1344,6 +1362,101 @@ class XWeComAdapter(BasePlatformAdapter):
             "expires_at": time.time() + expires_in,
         }
         return token
+
+    async def _send_agent_media(
+        self,
+        app: Dict[str, Any],
+        chat_id: str,
+        media_url: str,
+    ) -> SendResult:
+        if ClientSession is None or FormData is None:
+            return SendResult(success=False, error="aiohttp is required for Agent media send")
+        try:
+            media = await resolve_media_file(media_url, media_local_roots=None)
+            detected_type = detect_media_type(media.content_type, media.file_name)
+            size_check = apply_file_size_limits(
+                len(media.buffer), detected_type, media.content_type
+            )
+            if size_check.should_reject:
+                return SendResult(success=False, error=size_check.reject_reason or "file rejected")
+            final_type = size_check.final_type
+
+            for attempt in range(2):
+                token = await self._get_callback_access_token(app)
+                session = await self._ensure_callback_http_session()
+                form = FormData()
+                form.add_field(
+                    "media",
+                    media.buffer,
+                    filename=media.file_name,
+                    content_type=media.content_type or "application/octet-stream",
+                )
+                async with session.post(
+                    "https://qyapi.weixin.qq.com/cgi-bin/media/upload",
+                    params={"access_token": token, "type": final_type},
+                    data=form,
+                ) as resp:
+                    upload_data = await resp.json(content_type=None)
+                errcode = upload_data.get("errcode", 0)
+                if errcode in {40001, 42001} and attempt == 0:
+                    self._callback_access_tokens.pop(str(app.get("name") or ""), None)
+                    continue
+                if errcode != 0 or not upload_data.get("media_id"):
+                    return SendResult(
+                        success=False,
+                        error=f"Agent media upload failed: {upload_data}",
+                        raw_response=upload_data,
+                    )
+                break
+            else:
+                return SendResult(success=False, error="Agent media upload failed after token refresh")
+
+            target = _resolve_wecom_target(chat_id) or {"touser": chat_id}
+            media_id = str(upload_data["media_id"])
+            if target.get("chatid"):
+                url = "https://qyapi.weixin.qq.com/cgi-bin/appchat/send"
+                payload = {
+                    "chatid": target["chatid"],
+                    "msgtype": final_type,
+                    final_type: {"media_id": media_id},
+                }
+            else:
+                url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+                payload = {
+                    key: value
+                    for key, value in {
+                        "touser": target.get("touser"),
+                        "toparty": target.get("toparty"),
+                        "totag": target.get("totag"),
+                    }.items()
+                    if value
+                }
+                payload.update(
+                    {
+                        "msgtype": final_type,
+                        "agentid": int(str(app.get("agent_id") or 0)),
+                        final_type: {"media_id": media_id},
+                        "safe": 0,
+                    }
+                )
+
+            token = await self._get_callback_access_token(app)
+            session = await self._ensure_callback_http_session()
+            async with session.post(url, params={"access_token": token}, json=payload) as resp:
+                send_data = await resp.json(content_type=None)
+            if send_data.get("errcode") != 0:
+                return SendResult(
+                    success=False,
+                    error=f"Agent media send failed: {send_data}",
+                    raw_response=send_data,
+                )
+            return SendResult(
+                success=True,
+                message_id=str(send_data.get("msgid") or f"agent_media_{int(time.time())}"),
+                raw_response=send_data,
+            )
+        except Exception as err:  # noqa: BLE001
+            return SendResult(success=False, error=str(err))
 
     # ── Message parsing ─────────────────────────────────────────────────────
 
@@ -1992,6 +2105,21 @@ class XWeComAdapter(BasePlatformAdapter):
             )
             if result.ok:
                 continue
+            agent_app = self._resolve_agent_app_for_chat(chat_id)
+            if agent_app is not None:
+                logger.warning(
+                    "xwecom: WS media send failed for %s, trying Agent HTTP fallback: %s",
+                    media_url,
+                    getattr(result, "error", None) or getattr(result, "reject_reason", None),
+                )
+                fallback = await self._send_agent_media(agent_app, chat_id, media_url)
+                if fallback.success:
+                    continue
+                logger.warning(
+                    "xwecom: Agent HTTP media fallback failed for %s: %s",
+                    media_url,
+                    fallback.error,
+                )
             reason = (
                 getattr(result, "reject_reason", None)
                 or getattr(result, "error", None)

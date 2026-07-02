@@ -220,6 +220,38 @@ class TestAdapterReplyMediaDirectives:
         assert body["markdown"]["content"] == "文件已生成"
 
     @pytest.mark.asyncio
+    async def test_proactive_media_directive_falls_back_to_agent_http(self):
+        adapter = _make_adapter()
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+        adapter._callback_apps = [
+            {
+                "name": "default",
+                "corp_id": "corp",
+                "corp_secret": "secret",
+                "agent_id": "1000002",
+            }
+        ]
+        adapter._send_agent_media = AsyncMock(
+            return_value=SimpleNamespace(success=True, error=None)
+        )
+
+        async def fake_upload(client, media_url, chat_id, **kwargs):
+            return SimpleNamespace(ok=False, error="ws upload failed")
+
+        with patch("adapter.upload_and_send_media", side_effect=fake_upload):
+            result = await adapter.send("alice", "请查收\nFILE:/tmp/report.pdf")
+
+        assert result.success is True
+        adapter._send_agent_media.assert_awaited_once()
+        assert adapter._send_agent_media.await_args.args[1:] == (
+            "alice",
+            "/tmp/report.pdf",
+        )
+        body = adapter._client.send_message.await_args.args[1]
+        assert body["markdown"]["content"] == "请查收"
+        assert "文件发送失败" not in body["markdown"]["content"]
+
+    @pytest.mark.asyncio
     async def test_stream_final_consumes_media_directives_and_reports_failure(self):
         adapter = _make_adapter()
         frame = {
