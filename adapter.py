@@ -2279,16 +2279,32 @@ async def _standalone_send(
     if not (bot_id and secret):
         return {"error": "XWECOM_BOT_ID and XWECOM_SECRET required"}
 
-    opts = WSClientOptions(
-        bot_id=bot_id,
-        secret=secret,
-        ws_url=ws_url,
-        heartbeat_interval=30000,
-        max_reconnect_attempts=3,
-    )
-    client = WSClient(opts)
+    lock_acquired = False
+    if acquire_scoped_lock is not None:
+        lock_result = acquire_scoped_lock("xwecom", bot_id)
+        lock_acquired, existing = XWeComAdapter._interpret_scoped_lock_result(
+            lock_result
+        )
+        if not lock_acquired:
+            owner_pid = existing.get("pid") if existing else None
+            owner_suffix = f" (PID {owner_pid})" if owner_pid else ""
+            return {
+                "error": (
+                    "Standalone xwecom send skipped: token already in use"
+                    f"{owner_suffix}. Stop the other gateway first."
+                )
+            }
 
+    client: Optional[WSClient] = None
     try:
+        opts = WSClientOptions(
+            bot_id=bot_id,
+            secret=secret,
+            ws_url=ws_url,
+            heartbeat_interval=30000,
+            max_reconnect_attempts=3,
+        )
+        client = WSClient(opts)
         await client.connect()
         # Wait briefly for authentication
         await asyncio.sleep(2)
@@ -2296,14 +2312,17 @@ async def _standalone_send(
         body = {"msgtype": "markdown", "markdown": {"content": message}}
         await client.send_message(chat_id, body)
 
-        client.disconnect()
         return {"success": True, "message_id": f"cron_{int(time.time())}"}
     except Exception as e:
-        try:
-            client.disconnect()
-        except Exception:
-            pass
         return {"error": f"Standalone send failed: {e}"}
+    finally:
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        if lock_acquired and release_scoped_lock is not None:
+            release_scoped_lock("xwecom", bot_id)
 
 
 def register(ctx: Any) -> None:

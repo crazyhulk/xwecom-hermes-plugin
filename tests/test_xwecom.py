@@ -478,6 +478,46 @@ class TestPluginRegistration:
         assert kwargs["allowed_users_env"] == "XWECOM_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "XWECOM_ALLOW_ALL_USERS"
 
+    @pytest.mark.asyncio
+    async def test_standalone_send_refuses_when_scoped_lock_is_held(self):
+        from adapter import _standalone_send
+
+        config = MagicMock()
+        config.extra = {"bot_id": "bot_123", "secret": "secret_456"}
+
+        with (
+            patch("adapter.acquire_scoped_lock", return_value=(False, {"pid": 12345})),
+            patch("adapter.WSClient") as ws_client,
+        ):
+            result = await _standalone_send(config, "chat_1", "hello")
+
+        assert "token already in use (PID 12345)" in result["error"]
+        ws_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_standalone_send_releases_scoped_lock_after_send(self):
+        from adapter import _standalone_send
+
+        config = MagicMock()
+        config.extra = {"bot_id": "bot_123", "secret": "secret_456"}
+        client = MagicMock()
+        client.connect = AsyncMock()
+        client.send_message = AsyncMock()
+
+        with (
+            patch("adapter.acquire_scoped_lock", return_value=(True, None)),
+            patch("adapter.release_scoped_lock") as release_lock,
+            patch("adapter.WSClient", return_value=client),
+            patch("adapter.asyncio.sleep", new=AsyncMock()),
+        ):
+            result = await _standalone_send(config, "chat_1", "hello")
+
+        assert result["success"] is True
+        client.connect.assert_awaited_once()
+        client.send_message.assert_awaited_once()
+        client.disconnect.assert_called_once()
+        release_lock.assert_called_once_with("xwecom", "bot_123")
+
 
 # ── SDK patch verification ──────────────────────────────────────────────────
 
