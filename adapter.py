@@ -267,11 +267,20 @@ class TypingStream:
 class XWeComAdapter(BasePlatformAdapter):
     """WeCom adapter using official Python SDK."""
 
-    # WeCom can't edit sent messages. Newer Hermes runtimes can route deltas
-    # through send_stream_frame(); older runtimes skip streaming because editing
-    # is disabled and deliver the final answer through send(reply_to=...).
-    SUPPORTS_MESSAGE_EDITING = False
+    # Hermes' stream consumer models streaming as send() followed by cumulative
+    # edit_message() calls.  WeCom does not edit normal messages, but Bot WS
+    # replyStream has the same lifecycle and can implement that contract.
     SUPPORTS_NATIVE_STREAMING = True
+
+    @property
+    def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
+        """Expose replyStream as editing only while Bot WS is available."""
+        return self._client is not None
+
+    @property
+    def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
+        """WeCom needs an explicit finish=true frame to close the stream."""
+        return self._client is not None
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform("xwecom"))
@@ -366,6 +375,9 @@ class XWeComAdapter(BasePlatformAdapter):
         self._typing_streams: Dict[str, TypingStream] = {}
         self._typing_completed_req_ids: Dict[str, float] = {}
         self._stream_turns: Dict[str, StreamTurn] = {}
+        # Hermes message_id -> (chat_id, native turn_id).  The message_id is
+        # the official WeCom streamId, matching sendWeComReply's return value.
+        self._hermes_edit_streams: Dict[str, Tuple[str, str]] = {}
         self._stream_expired_chats: set = set()
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
@@ -579,6 +591,7 @@ class XWeComAdapter(BasePlatformAdapter):
         self._reply_frames.clear()
         self._typing_streams.clear()
         self._typing_completed_req_ids.clear()
+        self._hermes_edit_streams.clear()
         self._stream_expired_chats.clear()
         for task in list(self._pending_text_batch_tasks.values()):
             task.cancel()
@@ -611,9 +624,14 @@ class XWeComAdapter(BasePlatformAdapter):
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Send text, preferring a passive reply bound to the inbound message."""
-        del metadata
+        expect_edits = bool((metadata or {}).get("expect_edits"))
         callback_app = self._resolve_callback_app_for_chat(chat_id)
         if callback_app is not None:
+            if expect_edits:
+                return SendResult(
+                    success=False,
+                    error="WeCom Agent HTTP callbacks do not support editable previews",
+                )
             return await self._send_callback_text(callback_app, chat_id, content)
 
         if not self._client:
@@ -621,6 +639,13 @@ class XWeComAdapter(BasePlatformAdapter):
             if agent_app is not None:
                 return await self._send_callback_text(agent_app, chat_id, content)
             return SendResult(success=False, error="Not connected")
+
+        if expect_edits:
+            return await self._start_hermes_edit_stream(
+                chat_id,
+                content,
+                reply_to=reply_to,
+            )
 
         outbound_text = content
         reply_frame = self._reply_frame_for_message(reply_to)
@@ -720,6 +745,71 @@ class XWeComAdapter(BasePlatformAdapter):
             if agent_app is not None:
                 return await self._send_callback_text(agent_app, chat_id, outbound_text)
             return SendResult(success=False, error=str(e))
+
+    async def _start_hermes_edit_stream(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Optional[str],
+    ) -> SendResult:
+        """Translate Hermes' first editable send into a WeCom stream start."""
+        turn_id = f"hermes_edit_{uuid.uuid4().hex[:12]}"
+        ok = await self.send_stream_frame(
+            content,
+            chat_id=chat_id,
+            reply_to=reply_to,
+            turn_id=turn_id,
+        )
+        if not ok:
+            return SendResult(
+                success=False,
+                error="WeCom replyStream is unavailable for this message",
+            )
+
+        turn_key = self._stream_turn_key(chat_id, turn_id)
+        turn = self._stream_turns.get(turn_key)
+        if turn is None:
+            return SendResult(success=False, error="WeCom stream state was not created")
+
+        edit_streams = getattr(self, "_hermes_edit_streams", None)
+        if edit_streams is None:
+            edit_streams = {}
+            self._hermes_edit_streams = edit_streams
+        edit_streams[turn.stream_id] = (chat_id, turn_id)
+        return SendResult(success=True, message_id=turn.stream_id)
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Map Hermes cumulative edits onto the official replyStream lifecycle."""
+        edit_streams = getattr(self, "_hermes_edit_streams", {})
+        binding = edit_streams.get(str(message_id or ""))
+        if binding is None:
+            # Normal WeCom messages are immutable.  Returning failure lets the
+            # Hermes tool-progress rail fall back to separate completed sends.
+            return SendResult(success=False, error="Message is not an active WeCom stream")
+
+        bound_chat_id, turn_id = binding
+        if bound_chat_id != chat_id:
+            return SendResult(success=False, error="WeCom stream belongs to another chat")
+
+        ok = await self.send_stream_frame(
+            content,
+            chat_id=chat_id,
+            finalize=finalize,
+            turn_id=turn_id,
+        )
+        if finalize or not ok:
+            edit_streams.pop(message_id, None)
+        if not ok:
+            return SendResult(success=False, error="WeCom replyStream update failed")
+        return SendResult(success=True, message_id=message_id)
 
     @staticmethod
     def _response_error(response: Dict[str, Any]) -> Optional[str]:
@@ -1948,10 +2038,10 @@ class XWeComAdapter(BasePlatformAdapter):
             )
             turn.finalized = True
             self._cleanup_stream_turn(turn_key, turn)
-            # Final-frame ack timeout is non-fatal — WeCom usually already
-            # rendered the content by the time we hit the timeout.  Treat
-            # any return as success here.
-            return True
+            # _send_stream_reply_frame already treats a final-frame ACK timeout
+            # as success. Preserve other failures so Hermes can deliver its
+            # complete-response fallback instead of silently dropping it.
+            return ok
 
         # ── Intermediate frame via the block chunker ────────────────────
         if turn.chunker is None:
@@ -1989,14 +2079,14 @@ class XWeComAdapter(BasePlatformAdapter):
     ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
         """Pick the (req_id, frame) tuple to use for a stream reply.
 
-        Currently uses the most recent inbound message for the chat —
-        ``reply_to`` is accepted for forward compatibility but not yet
-        keyed because WeCom doesn't expose a stable per-message id we can
-        index back to its frame.
+        Prefer Hermes' reply anchor so concurrent turns in one chat stay bound
+        to their own inbound req_id. Fall back to the most recent chat frame
+        for callers that do not carry a reply_to message id.
         """
-        del reply_to
-        req_id = self._last_chat_req_ids.get(chat)
-        frame = self._last_chat_frames.get(chat)
+        frame = self._reply_frame_for_message(reply_to)
+        if frame is None:
+            frame = self._last_chat_frames.get(chat)
+        req_id = self._frame_req_id(frame) or self._last_chat_req_ids.get(chat)
         return req_id, frame
 
     @staticmethod

@@ -109,6 +109,12 @@ startAgentForStream 结束时:
 ### xwecom-hermes-plugin（我们的实现）
 
 ```
+Hermes GatewayStreamConsumer:
+  send(metadata.expect_edits=true)
+    → 创建 native turn，返回 WeCom streamId 作为 Hermes message_id
+  edit_message(message_id=streamId, cumulative_text, finalize=...)
+    → send_stream_frame(...)
+
 send_stream_frame(finalize=True):
   1. _cancel_idle_flush(turn)
   2. if turn.chunker is not None:

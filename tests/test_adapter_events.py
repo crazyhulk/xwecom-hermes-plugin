@@ -33,6 +33,7 @@ def _make_adapter():
     adapter._reply_frames = {}
     adapter._typing_streams = {}
     adapter._typing_completed_req_ids = {}
+    adapter._hermes_edit_streams = {}
     adapter._stream_expired_chats = set()
     adapter._stream_turns = {}
     adapter._stream_gate = NonBlockingStreamGate()
@@ -61,11 +62,16 @@ def _make_adapter():
 
 
 class TestHermesAdapterContract:
-    def test_disables_edit_streaming(self):
-        from adapter import XWeComAdapter
+    def test_exposes_edit_streaming_only_for_bot_ws(self):
+        adapter = _make_adapter()
 
-        assert XWeComAdapter.SUPPORTS_MESSAGE_EDITING is False
-        assert XWeComAdapter.SUPPORTS_NATIVE_STREAMING is True
+        assert adapter.SUPPORTS_MESSAGE_EDITING is True
+        assert adapter.REQUIRES_EDIT_FINALIZE is True
+        assert adapter.SUPPORTS_NATIVE_STREAMING is True
+
+        adapter._client = None
+        assert adapter.SUPPORTS_MESSAGE_EDITING is False
+        assert adapter.REQUIRES_EDIT_FINALIZE is False
 
     def test_declares_adapter_policy_enforcement(self):
         adapter = _make_adapter()
@@ -164,6 +170,64 @@ class TestHermesAdapterContract:
         assert turn.stream_id == stream_id
         assert turn.seeded is True
         assert "chat1" not in adapter._typing_streams
+
+    @pytest.mark.asyncio
+    async def test_hermes_send_edit_contract_maps_to_reply_stream(self):
+        from message_sender import THINKING_MESSAGE
+
+        adapter = _make_adapter()
+        frame = {
+            "headers": {"req_id": "REQ1"},
+            "body": {"msgid": "MSG1", "chatid": "chat1"},
+        }
+        adapter._last_chat_req_ids["chat1"] = "REQ1"
+        adapter._last_chat_frames["chat1"] = frame
+        adapter._reply_frames["MSG1"] = frame
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+
+        started = await adapter.send(
+            "chat1",
+            "first tokens",
+            reply_to="MSG1",
+            metadata={"expect_edits": True},
+        )
+
+        assert started.success is True
+        assert started.message_id.startswith("stream_")
+        seed_args = adapter._client.reply_stream.await_args_list[0].args
+        assert seed_args[0] is frame
+        assert seed_args[1] == started.message_id
+        assert seed_args[2] == THINKING_MESSAGE
+        assert seed_args[3] is False
+
+        updated = await adapter.edit_message(
+            "chat1",
+            started.message_id,
+            "first tokens and the final answer",
+            finalize=True,
+        )
+
+        assert updated.success is True
+        final_args = adapter._client.reply_stream.await_args.args
+        assert final_args[0] is frame
+        assert final_args[1] == started.message_id
+        assert final_args[2] == "first tokens and the final answer"
+        assert final_args[3] is True
+        assert started.message_id not in adapter._hermes_edit_streams
+        assert adapter._stream_turns == {}
+
+    @pytest.mark.asyncio
+    async def test_edit_rejects_normal_completed_message(self):
+        adapter = _make_adapter()
+
+        result = await adapter.edit_message(
+            "chat1",
+            "xwecom_chat1_123",
+            "tool progress update",
+        )
+
+        assert result.success is False
+        assert "not an active" in result.error
 
     @pytest.mark.asyncio
     async def test_text_falls_back_to_agent_when_bot_is_disconnected(self):
@@ -700,6 +764,23 @@ class TestAdapterCallbackInbound:
         assert result.message_id == "OUT1"
         assert post_calls[0][1]["params"] == {"access_token": "ACCESS"}
         assert post_calls[0][1]["json"]["touser"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_callback_chat_rejects_editable_preview(self):
+        adapter = _make_adapter()
+        adapter._callback_apps = [{"name": "default"}]
+        adapter._callback_chat_apps = {"wxCORP:alice": "default"}
+        adapter._send_callback_text = AsyncMock()
+
+        result = await adapter.send(
+            "wxCORP:alice",
+            "partial preview",
+            metadata={"expect_edits": True},
+        )
+
+        assert result.success is False
+        assert "do not support editable previews" in result.error
+        adapter._send_callback_text.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_callback_text_is_chunked_by_utf8_bytes(self):

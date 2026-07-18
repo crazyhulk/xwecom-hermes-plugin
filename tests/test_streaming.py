@@ -491,3 +491,27 @@ class TestFinalizeWithChunker:
             full_text, finalize=True, chat_id="chat1"
         )
         assert ok is True
+
+    @pytest.mark.asyncio
+    async def test_finalize_preserves_non_timeout_send_failure(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(
+            side_effect=[
+                {"errcode": 0},
+                {"errcode": 40001, "errmsg": "invalid request"},
+            ]
+        )
+        adapter._client = client
+        _bind_chat(adapter)
+
+        assert await adapter.send_stream_frame("", chat_id="chat1") is True
+
+        ok = await adapter.send_stream_frame(
+            "complete answer",
+            finalize=True,
+            chat_id="chat1",
+        )
+
+        assert ok is False
+        assert adapter._stream_turns == {}
