@@ -625,6 +625,7 @@ class XWeComAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send text, preferring a passive reply bound to the inbound message."""
         expect_edits = bool((metadata or {}).get("expect_edits"))
+        terminal_delivery = bool((metadata or {}).get("notify")) or reply_to is not None
         callback_app = self._resolve_callback_app_for_chat(chat_id)
         if callback_app is not None:
             if expect_edits:
@@ -701,8 +702,6 @@ class XWeComAdapter(BasePlatformAdapter):
                     True,
                 )
                 responses.append(response)
-                if self._response_error(response) is None:
-                    self._complete_typing_stream(chat_id, reply_frame)
             else:
                 chunks = self._split_text_by_byte_limit(outbound_text, MAX_MESSAGE_LENGTH)
 
@@ -726,6 +725,15 @@ class XWeComAdapter(BasePlatformAdapter):
                         )
                         return await self._send_callback_text(agent_app, chat_id, outbound_text)
                     return SendResult(success=False, error=error, raw_response=response)
+
+            if typing_stream is not None:
+                self._complete_typing_stream(
+                    chat_id,
+                    reply_frame,
+                    terminal=terminal_delivery,
+                )
+            if not terminal_delivery:
+                await self._resume_typing_after_interim(chat_id)
 
             msg_id = f"xwecom_{chat_id}_{int(time.time() * 1000)}"
             return SendResult(success=True, message_id=msg_id, raw_response=responses)
@@ -860,14 +868,34 @@ class XWeComAdapter(BasePlatformAdapter):
             completed.pop(next(iter(completed)))
 
     def _complete_typing_stream(
-        self, chat_id: str, frame: Optional[Dict[str, Any]]
+        self,
+        chat_id: str,
+        frame: Optional[Dict[str, Any]],
+        *,
+        terminal: bool = True,
     ) -> None:
         req_id = self._frame_req_id(frame)
         typing_streams = getattr(self, "_typing_streams", {})
         state = typing_streams.get(chat_id)
         if state is not None and state.req_id == req_id:
             typing_streams.pop(chat_id, None)
-        self._mark_typing_completed(req_id)
+        if terminal:
+            self._mark_typing_completed(req_id)
+
+    async def _resume_typing_after_interim(self, chat_id: str) -> None:
+        """Show continued activity after commentary or tool progress.
+
+        Hermes delivers these as completed messages even though the overall
+        turn is still running. A previous stream segment may have marked the
+        inbound req_id complete, so clear that turn-local latch before opening
+        a fresh thinking stream.
+        """
+        frame = self._last_chat_frames.get(chat_id)
+        req_id = self._frame_req_id(frame)
+        if not frame or not req_id:
+            return
+        self._typing_completed_req_ids.pop(req_id, None)
+        await self.send_typing(chat_id)
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """Open one WeCom thinking stream for the current inbound request."""

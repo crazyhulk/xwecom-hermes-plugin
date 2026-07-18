@@ -21,6 +21,7 @@
 - Callback/Agent 文本按 UTF-8 字节边界分块，不再使用 `content[:2048]` 静默截断。
 - Bot WS 文本或媒体发送不可用时，自动降级到已配置的 Agent HTTP API；Agent 群聊目标使用 `appchat/send`。
 - Hermes `send_typing()` 使用企微 thinking stream 显示输入状态；首个 editable send 会接管同一 `stream_id`，最终 `edit_message(finalize=true)` 关闭占位。
+- Interim assistant commentary 和 Hermes tool progress 是已完成的独立消息，但不代表整轮结束；发送后会立即创建新的 typing stream。只有带 `notify` 的最终回复（或明确 `reply_to` 的最终被动回复）才将当前 req_id 标记完成，避免用户无法区分“仍在处理”和“已经卡住”。
 
 - `adapter.py` 接入 `state_manager`：连接成功后登记 WSClient 和连接状态；入站消息记录 `chat_id -> req_id`，供流式回复复用；断开时清理连接状态。
 - `adapter.py` 接入 `monitor`：普通消息通过 `run_with_message_timeout` 做处理超时保护，并用 `SessionRecorder` 标记 processing/finished/failed/timeout。
@@ -69,6 +70,6 @@ python3 -m py_compile adapter.py tests/test_streaming.py tests/test_adapter_even
 python3 -m pytest tests/ -q
 ```
 
-当前结果：`266 passed`，并已使用 Jarvis 实际安装版 Hermes 的
+当前结果：`268 passed`，并已使用 Jarvis 实际安装版 Hermes 的
 `GatewayStreamConsumer` 完成进程内 `send -> edit_message -> finish=true`
 集成验证。

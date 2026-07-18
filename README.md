@@ -73,7 +73,7 @@ gateway:
 - ✅ Passive replies bound to the inbound WeCom `req_id` (no active-send quota for normal replies)
 - ✅ Native WeCom streaming through Hermes' `send`/`edit_message` contract
 - ✅ Dynamic streaming capability: Bot WS streams, Agent HTTP falls back to one final reply
-- ✅ WeCom thinking/typing placeholder finalized by the passive reply
+- ✅ Continuous typing across commentary/tool progress, finalized by the final reply
 - ✅ UTF-8 byte-safe text chunking without silent truncation
 - ✅ Media upload/download with AES decryption
 - ✅ Native Hermes image, document, voice, and video delivery methods

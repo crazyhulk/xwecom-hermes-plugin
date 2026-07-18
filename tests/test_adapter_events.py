@@ -135,6 +135,74 @@ class TestHermesAdapterContract:
         assert adapter._client.reply_stream.await_count == 2
 
     @pytest.mark.asyncio
+    async def test_interim_message_reopens_typing_until_final_reply(self):
+        from message_sender import THINKING_MESSAGE
+
+        adapter = _make_adapter()
+        frame = {
+            "headers": {"req_id": "REQ1"},
+            "body": {"msgid": "MSG1", "chatid": "chat1"},
+        }
+        adapter._last_chat_frames["chat1"] = frame
+        adapter._reply_frames["MSG1"] = frame
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+
+        await adapter.send_typing("chat1")
+        first_stream_id = adapter._client.reply_stream.await_args.args[1]
+
+        interim = await adapter.send("chat1", "正在检查代码")
+
+        assert interim.success is True
+        assert adapter._client.reply_stream.await_count == 3
+        interim_args = adapter._client.reply_stream.await_args_list[1].args
+        assert interim_args[1] == first_stream_id
+        assert interim_args[2] == "正在检查代码"
+        assert interim_args[3] is True
+        resumed_args = adapter._client.reply_stream.await_args_list[2].args
+        assert resumed_args[1] != first_stream_id
+        assert resumed_args[2] == THINKING_MESSAGE
+        assert resumed_args[3] is False
+        assert "REQ1" not in adapter._typing_completed_req_ids
+
+        final = await adapter.send(
+            "chat1",
+            "最终回复",
+            reply_to="MSG1",
+            metadata={"notify": True},
+        )
+
+        assert final.success is True
+        assert adapter._client.reply_stream.await_count == 4
+        final_args = adapter._client.reply_stream.await_args.args
+        assert final_args[1] == resumed_args[1]
+        assert final_args[2] == "最终回复"
+        assert final_args[3] is True
+        assert "chat1" not in adapter._typing_streams
+        assert "REQ1" in adapter._typing_completed_req_ids
+
+    @pytest.mark.asyncio
+    async def test_tool_progress_resumes_typing_after_segment_finalize(self):
+        from message_sender import THINKING_MESSAGE
+
+        adapter = _make_adapter()
+        frame = {"headers": {"req_id": "REQ1"}, "body": {"chatid": "chat1"}}
+        adapter._last_chat_frames["chat1"] = frame
+        adapter._typing_completed_req_ids["REQ1"] = 1.0
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+
+        progress = await adapter.send("chat1", "Reading adapter.py")
+
+        assert progress.success is True
+        adapter._client.send_message.assert_awaited_once()
+        typing_args = adapter._client.reply_stream.await_args.args
+        assert typing_args[0] is frame
+        assert typing_args[2] == THINKING_MESSAGE
+        assert typing_args[3] is False
+        assert "REQ1" not in adapter._typing_completed_req_ids
+
+    @pytest.mark.asyncio
     async def test_stop_typing_finishes_orphaned_placeholder(self):
         adapter = _make_adapter()
         frame = {"headers": {"req_id": "REQ1"}, "body": {"chatid": "chat1"}}
