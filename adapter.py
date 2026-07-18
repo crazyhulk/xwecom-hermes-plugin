@@ -251,6 +251,19 @@ class StreamTurn:
         self.start_time = time.monotonic()
 
 
+class TypingStream:
+    """A WeCom thinking placeholder owned by Hermes' typing lifecycle."""
+
+    __slots__ = ("frame", "req_id", "stream_id", "last_sent_at", "finalizing")
+
+    def __init__(self, frame: Dict[str, Any]):
+        self.frame = frame
+        self.req_id = str((frame.get("headers") or {}).get("req_id") or "")
+        self.stream_id = f"stream_{uuid.uuid4().hex[:12]}"
+        self.last_sent_at = 0.0
+        self.finalizing = False
+
+
 class XWeComAdapter(BasePlatformAdapter):
     """WeCom adapter using official Python SDK."""
 
@@ -293,6 +306,9 @@ class XWeComAdapter(BasePlatformAdapter):
             or os.getenv("XWECOM_REPLY_ACK_TIMEOUT_S", "30")
         )
         self._connect_timeout_s = float(extra.get("connect_timeout_s", 20.0))
+        self._send_thinking_message = self._truthy(
+            extra.get("send_thinking_message", extra.get("sendThinkingMessage", True))
+        )
         self._text_batch_delay_s = float(
             extra.get("text_batch_delay_s", TEXT_BATCH_DELAY_SECONDS)
         )
@@ -347,6 +363,8 @@ class XWeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids: Dict[str, str] = {}
         self._last_chat_frames: Dict[str, Dict[str, Any]] = {}
         self._reply_frames: Dict[str, Dict[str, Any]] = {}
+        self._typing_streams: Dict[str, TypingStream] = {}
+        self._typing_completed_req_ids: Dict[str, float] = {}
         self._stream_turns: Dict[str, StreamTurn] = {}
         self._stream_expired_chats: set = set()
         self._pending_text_batches: Dict[str, MessageEvent] = {}
@@ -559,6 +577,8 @@ class XWeComAdapter(BasePlatformAdapter):
         self._last_chat_req_ids.clear()
         self._last_chat_frames.clear()
         self._reply_frames.clear()
+        self._typing_streams.clear()
+        self._typing_completed_req_ids.clear()
         self._stream_expired_chats.clear()
         for task in list(self._pending_text_batch_tasks.values()):
             task.cancel()
@@ -604,6 +624,15 @@ class XWeComAdapter(BasePlatformAdapter):
 
         outbound_text = content
         reply_frame = self._reply_frame_for_message(reply_to)
+        typing_stream = self._typing_streams.get(chat_id)
+        if typing_stream is not None:
+            frame_req_id = self._frame_req_id(reply_frame)
+            if reply_frame is None:
+                reply_frame = typing_stream.frame
+            elif frame_req_id != typing_stream.req_id:
+                typing_stream = None
+        if typing_stream is not None:
+            typing_stream.finalizing = True
         card_frame = reply_frame or self._build_outbound_frame(chat_id, reply_to)
         try:
             card_result = await process_template_cards_if_needed(
@@ -638,11 +667,17 @@ class XWeComAdapter(BasePlatformAdapter):
                 first = chunks.pop(0)
                 response = await self._client.reply_stream(
                     reply_frame,
-                    f"stream_{uuid.uuid4().hex[:12]}",
+                    (
+                        typing_stream.stream_id
+                        if typing_stream is not None
+                        else f"stream_{uuid.uuid4().hex[:12]}"
+                    ),
                     first,
                     True,
                 )
                 responses.append(response)
+                if self._response_error(response) is None:
+                    self._complete_typing_stream(chat_id, reply_frame)
             else:
                 chunks = self._split_text_by_byte_limit(outbound_text, MAX_MESSAGE_LENGTH)
 
@@ -656,6 +691,8 @@ class XWeComAdapter(BasePlatformAdapter):
             for response in responses:
                 error = self._response_error(response)
                 if error:
+                    if typing_stream is not None:
+                        typing_stream.finalizing = False
                     agent_app = self._resolve_agent_app_for_chat(chat_id)
                     if agent_app is not None:
                         logger.warning(
@@ -668,12 +705,16 @@ class XWeComAdapter(BasePlatformAdapter):
             msg_id = f"xwecom_{chat_id}_{int(time.time() * 1000)}"
             return SendResult(success=True, message_id=msg_id, raw_response=responses)
         except RuntimeError as e:
+            if typing_stream is not None:
+                typing_stream.finalizing = False
             logger.error(f"xwecom send failed (not connected): {e}")
             agent_app = self._resolve_agent_app_for_chat(chat_id)
             if agent_app is not None:
                 return await self._send_callback_text(agent_app, chat_id, outbound_text)
             return SendResult(success=False, error=str(e))
         except Exception as e:
+            if typing_stream is not None:
+                typing_stream.finalizing = False
             logger.error(f"xwecom send failed: {e}")
             agent_app = self._resolve_agent_app_for_chat(chat_id)
             if agent_app is not None:
@@ -709,6 +750,107 @@ class XWeComAdapter(BasePlatformAdapter):
         if not key or key.startswith("quote:"):
             return None
         return getattr(self, "_reply_frames", {}).get(key)
+
+    @staticmethod
+    def _frame_req_id(frame: Optional[Dict[str, Any]]) -> str:
+        if not frame:
+            return ""
+        return str((frame.get("headers") or {}).get("req_id") or "")
+
+    def _mark_typing_completed(self, req_id: str) -> None:
+        key = str(req_id or "").strip()
+        if not key:
+            return
+        completed = getattr(self, "_typing_completed_req_ids", None)
+        if completed is None:
+            completed = {}
+            self._typing_completed_req_ids = completed
+        completed[key] = time.monotonic()
+        while len(completed) > DEDUP_MAX_SIZE:
+            completed.pop(next(iter(completed)))
+
+    def _complete_typing_stream(
+        self, chat_id: str, frame: Optional[Dict[str, Any]]
+    ) -> None:
+        req_id = self._frame_req_id(frame)
+        typing_streams = getattr(self, "_typing_streams", {})
+        state = typing_streams.get(chat_id)
+        if state is not None and state.req_id == req_id:
+            typing_streams.pop(chat_id, None)
+        self._mark_typing_completed(req_id)
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Open one WeCom thinking stream for the current inbound request."""
+        del metadata
+        if not self._send_thinking_message or not self._client:
+            return
+        frame = self._last_chat_frames.get(chat_id)
+        req_id = self._frame_req_id(frame)
+        if not frame or not req_id or req_id in self._typing_completed_req_ids:
+            return
+        if any(
+            turn.chat_id == chat_id and not turn.finalized and not turn.expired
+            for turn in self._stream_turns.values()
+        ):
+            return
+
+        state = self._typing_streams.get(chat_id)
+        if state is not None and state.req_id != req_id:
+            self._typing_streams.pop(chat_id, None)
+            self._mark_typing_completed(state.req_id)
+            state = None
+        if state is None:
+            state = TypingStream(frame)
+            self._typing_streams[chat_id] = state
+        if state.finalizing:
+            return
+
+        now = time.monotonic()
+        keepalive_after = max(1.0, self._stream_keepalive_interval_s)
+        if state.last_sent_at and now - state.last_sent_at < keepalive_after:
+            return
+        state.last_sent_at = now
+        try:
+            response = await asyncio.shield(
+                self._client.reply_stream(
+                    state.frame,
+                    state.stream_id,
+                    THINKING_MESSAGE,
+                    False,
+                )
+            )
+            error = self._response_error(response)
+            if error:
+                logger.debug("xwecom: typing stream rejected: %s", error)
+                self._typing_streams.pop(chat_id, None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as err:
+            self._typing_streams.pop(chat_id, None)
+            logger.debug("xwecom: typing stream failed: %s", err)
+
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        """Finish an orphaned thinking stream when no normal reply closed it."""
+        del metadata
+        state = self._typing_streams.get(chat_id)
+        if state is None or state.finalizing or not self._client:
+            return
+        state.finalizing = True
+        try:
+            response = await self._client.reply_stream(
+                state.frame,
+                state.stream_id,
+                "已收到。",
+                True,
+            )
+            error = self._response_error(response)
+            if error:
+                logger.debug("xwecom: stop typing stream rejected: %s", error)
+        except Exception as err:
+            logger.debug("xwecom: stop typing stream failed: %s", err)
+        finally:
+            self._typing_streams.pop(chat_id, None)
+            self._mark_typing_completed(state.req_id)
 
     @staticmethod
     def _build_outbound_frame(
@@ -1682,7 +1824,7 @@ class XWeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> bool:
-        """Legacy direct WeCom stream entry-point, not called by Hermes.
+        """Direct WeCom stream entry-point for native-capable Hermes runtimes.
 
         Lifecycle (per turn):
 
@@ -1748,6 +1890,17 @@ class XWeComAdapter(BasePlatformAdapter):
                 return False
 
             turn = StreamTurn(chat, req_id, frame)
+            typing_streams = getattr(self, "_typing_streams", {})
+            typing_state = typing_streams.get(chat)
+            if typing_state is not None and typing_state.req_id == req_id:
+                # Hermes fallback typing may win the race with native streaming.
+                # Adopt its stream instead of opening a second WeCom bubble.
+                turn.stream_id = typing_state.stream_id
+                turn.seeded = bool(typing_state.last_sent_at)
+                if turn.seeded:
+                    turn.last_wire_content = THINKING_MESSAGE
+                typing_streams.pop(chat, None)
+                self._mark_typing_completed(req_id)
             self._stream_turns[turn_key] = turn
             logger.debug(
                 "xwecom: new stream turn %s for chat %s (req_id=%s, turn_id=%s)",
@@ -2324,6 +2477,8 @@ class XWeComAdapter(BasePlatformAdapter):
         self._cancel_keepalive(turn)
         self._cancel_rotation(turn)
         self._stream_turns.pop(turn_key, None)
+        if turn.finalized:
+            self._mark_typing_completed(turn.req_id)
 
     # ── Idle flush ──────────────────────────────────────────────────────────
 

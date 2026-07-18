@@ -31,6 +31,8 @@ def _make_adapter():
     adapter._last_chat_req_ids = {}
     adapter._last_chat_frames = {}
     adapter._reply_frames = {}
+    adapter._typing_streams = {}
+    adapter._typing_completed_req_ids = {}
     adapter._stream_expired_chats = set()
     adapter._stream_turns = {}
     adapter._stream_gate = NonBlockingStreamGate()
@@ -42,6 +44,7 @@ def _make_adapter():
     adapter._welcome_text = ""
     adapter._stream_keepalive_interval_s = 240.0
     adapter._stream_rotate_after_s = 300.0
+    adapter._send_thinking_message = True
     adapter._text_batch_delay_s = 0.0
     adapter._text_batch_split_delay_s = 0.0
     adapter._pending_text_batches = {}
@@ -88,6 +91,79 @@ class TestHermesAdapterContract:
         assert adapter._client.reply_stream.await_args.args[2] == "final answer"
         assert adapter._client.reply_stream.await_args.args[3] is True
         adapter._client.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_typing_seed_is_reused_by_final_reply(self):
+        from message_sender import THINKING_MESSAGE
+
+        adapter = _make_adapter()
+        frame = {
+            "headers": {"req_id": "REQ1"},
+            "body": {"msgid": "MSG1", "chatid": "chat1"},
+        }
+        adapter._last_chat_frames["chat1"] = frame
+        adapter._reply_frames["MSG1"] = frame
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+
+        await adapter.send_typing("chat1")
+        await adapter.send_typing("chat1")
+
+        assert adapter._client.reply_stream.await_count == 1
+        seed_args = adapter._client.reply_stream.await_args.args
+        assert seed_args[2] == THINKING_MESSAGE
+        assert seed_args[3] is False
+        stream_id = seed_args[1]
+
+        result = await adapter.send("chat1", "final answer", reply_to="MSG1")
+
+        assert result.success is True
+        assert adapter._client.reply_stream.await_count == 2
+        final_args = adapter._client.reply_stream.await_args.args
+        assert final_args[1] == stream_id
+        assert final_args[2] == "final answer"
+        assert final_args[3] is True
+        assert "chat1" not in adapter._typing_streams
+
+        await adapter.send_typing("chat1")
+        assert adapter._client.reply_stream.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_stop_typing_finishes_orphaned_placeholder(self):
+        adapter = _make_adapter()
+        frame = {"headers": {"req_id": "REQ1"}, "body": {"chatid": "chat1"}}
+        adapter._last_chat_frames["chat1"] = frame
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+
+        await adapter.send_typing("chat1")
+        stream_id = adapter._client.reply_stream.await_args.args[1]
+        await adapter.stop_typing("chat1")
+
+        assert adapter._client.reply_stream.await_count == 2
+        final_args = adapter._client.reply_stream.await_args.args
+        assert final_args[1] == stream_id
+        assert final_args[2] == "已收到。"
+        assert final_args[3] is True
+        assert "chat1" not in adapter._typing_streams
+
+    @pytest.mark.asyncio
+    async def test_native_stream_adopts_existing_typing_seed(self):
+        adapter = _make_adapter()
+        frame = {"headers": {"req_id": "REQ1"}, "body": {"chatid": "chat1"}}
+        adapter._last_chat_req_ids["chat1"] = "REQ1"
+        adapter._last_chat_frames["chat1"] = frame
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+
+        await adapter.send_typing("chat1")
+        stream_id = adapter._client.reply_stream.await_args.args[1]
+        ok = await adapter.send_stream_frame("", chat_id="chat1")
+
+        assert ok is True
+        assert adapter._client.reply_stream.await_count == 1
+        turn = next(iter(adapter._stream_turns.values()))
+        assert turn.stream_id == stream_id
+        assert turn.seeded is True
+        assert "chat1" not in adapter._typing_streams
 
     @pytest.mark.asyncio
     async def test_text_falls_back_to_agent_when_bot_is_disconnected(self):

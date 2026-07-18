@@ -73,6 +73,7 @@ gateway:
 - ✅ Passive replies bound to the inbound WeCom `req_id` (no active-send quota for normal replies)
 - ✅ Native WeCom streaming on compatible Hermes runtimes, with passive final-reply fallback
 - ✅ Hermes-compatible non-editing fallback (no partial/duplicate preview messages)
+- ✅ WeCom thinking/typing placeholder finalized by the passive reply
 - ✅ UTF-8 byte-safe text chunking without silent truncation
 - ✅ Media upload/download with AES decryption
 - ✅ Native Hermes image, document, voice, and video delivery methods

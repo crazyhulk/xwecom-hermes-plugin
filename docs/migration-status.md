@@ -19,6 +19,7 @@
 - `dm_policy=pairing` 不再在 adapter 内按 allowlist 提前丢弃，而是放行到 Hermes 核心生成/校验配对码；同时声明 adapter 自己执行 allowlist，避免 Hermes 对 config allowlist 二次拒绝。
 - Callback/Agent 文本按 UTF-8 字节边界分块，不再使用 `content[:2048]` 静默截断。
 - Bot WS 文本或媒体发送不可用时，自动降级到已配置的 Agent HTTP API；Agent 群聊目标使用 `appchat/send`。
+- Hermes `send_typing()` 使用企微 thinking stream 显示输入状态；最终被动回复复用同一 `stream_id` 关闭占位，避免恢复编辑式增量输出。
 
 - `adapter.py` 接入 `state_manager`：连接成功后登记 WSClient 和连接状态；入站消息记录 `chat_id -> req_id`，供流式回复复用；断开时清理连接状态。
 - `adapter.py` 接入 `monitor`：普通消息通过 `run_with_message_timeout` 做处理超时保护，并用 `SessionRecorder` 标记 processing/finished/failed/timeout。
@@ -67,4 +68,4 @@ python3 -m py_compile adapter.py tests/test_streaming.py tests/test_adapter_even
 python3 -m pytest tests/ -q
 ```
 
-当前结果：`259 passed`。
+当前结果：`262 passed`。
