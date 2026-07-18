@@ -221,6 +221,26 @@ class TestHermesAdapterContract:
         assert "chat1" not in adapter._typing_streams
 
     @pytest.mark.asyncio
+    async def test_clarify_fallback_marks_prompt_terminal(self):
+        adapter = _make_adapter()
+        result = SimpleNamespace(success=True)
+
+        with patch.object(
+            type(adapter).__mro__[1],
+            "send_clarify",
+            new=AsyncMock(return_value=result),
+            create=True,
+        ) as base_send:
+            sent = await adapter.send_clarify(
+                "chat1", "请选择", ["A", "B"], "clarify1", "session1"
+            )
+
+        assert sent is result
+        metadata = base_send.await_args.kwargs["metadata"]
+        assert metadata["notify"] is True
+        assert metadata["interactive_prompt"] is True
+
+    @pytest.mark.asyncio
     async def test_native_stream_adopts_existing_typing_seed(self):
         adapter = _make_adapter()
         frame = {"headers": {"req_id": "REQ1"}, "body": {"chatid": "chat1"}}

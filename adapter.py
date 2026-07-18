@@ -819,6 +819,28 @@ class XWeComAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="WeCom replyStream update failed")
         return SendResult(success=True, message_id=message_id)
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Close fallback typing while Hermes waits for interactive input."""
+        prompt_metadata = dict(metadata or {})
+        prompt_metadata["notify"] = True
+        prompt_metadata["interactive_prompt"] = True
+        return await super().send_clarify(
+            chat_id=chat_id,
+            question=question,
+            choices=choices,
+            clarify_id=clarify_id,
+            session_key=session_key,
+            metadata=prompt_metadata,
+        )
+
     @staticmethod
     def _response_error(response: Dict[str, Any]) -> Optional[str]:
         payload = response.get("data") if isinstance(response.get("data"), dict) else {}
@@ -1931,7 +1953,7 @@ class XWeComAdapter(BasePlatformAdapter):
     ) -> bool:
         """Enable WeCom streaming when the Hermes runtime supports the seam."""
         del chat_type, metadata
-        return True
+        return self._client is not None
 
     async def send_stream_frame(
         self,
@@ -1974,6 +1996,7 @@ class XWeComAdapter(BasePlatformAdapter):
             return False
 
         turn_id = kwargs.get("turn_id")
+        snapshot = bool(kwargs.get("snapshot"))
 
         # Chat-level stream expiry blocks NEW turn creation only.  An
         # already-active turn (looked up by turn_id) can keep going.
@@ -2028,7 +2051,10 @@ class XWeComAdapter(BasePlatformAdapter):
         if turn.expired or turn.finalized:
             return False
 
-        turn_text = self._turn_visible_text(turn, text)
+        # Snapshot consumers compose progress, heartbeat and answer text into
+        # one mutable bubble, so their updates are replacements rather than a
+        # monotonically growing token buffer.
+        turn_text = (text or "") if snapshot else self._turn_visible_text(turn, text)
 
         # ── Seed frame ──────────────────────────────────────────────────
         if not turn.seeded:
@@ -2069,6 +2095,27 @@ class XWeComAdapter(BasePlatformAdapter):
             # _send_stream_reply_frame already treats a final-frame ACK timeout
             # as success. Preserve other failures so Hermes can deliver its
             # complete-response fallback instead of silently dropping it.
+            return ok
+
+        # Native turn snapshots bypass the sentence chunker: a later update
+        # may intentionally be shorter (for example final answer replacing
+        # transient tool progress), and length-based cumulative bookkeeping
+        # would otherwise suppress it.
+        if snapshot:
+            turn.pending_cumulative = turn_text
+            if turn_text == turn.last_sent_content:
+                return True
+            if turn.frame_count >= MAX_INTERMEDIATE_FRAMES:
+                return True
+            self._cancel_idle_flush(turn)
+            ok = await self._send_stream_reply_frame(turn, turn_text, finish=False)
+            if ok:
+                turn.frame_count += 1
+                turn.last_sent_content = turn_text
+                if turn.chunker is None:
+                    turn.chunker = BlockChunker()
+                turn.chunker.reset()
+                turn.chunker.mark_emitted(turn_text)
             return ok
 
         # ── Intermediate frame via the block chunker ────────────────────

@@ -70,9 +70,13 @@ class TestSupportsNativeStreaming:
 
     def test_instance_method_returns_true(self):
         adapter = _make_adapter()
+        adapter._client = MagicMock()
         assert adapter.supports_native_streaming() is True
         assert adapter.supports_native_streaming(chat_type="group") is True
         assert adapter.supports_native_streaming(chat_type="dm") is True
+
+        adapter._client = None
+        assert adapter.supports_native_streaming() is False
 
 
 class TestTextByteChunking:
@@ -515,3 +519,40 @@ class TestFinalizeWithChunker:
 
         assert ok is False
         assert adapter._stream_turns == {}
+
+
+class TestSnapshotFrames:
+    """Native activity composition can replace, not only append, content."""
+
+    @pytest.mark.asyncio
+    async def test_shorter_snapshot_replaces_tool_progress(self):
+        adapter = _make_adapter()
+        client = MagicMock()
+        client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client = client
+        _bind_chat(adapter)
+
+        assert await adapter.send_stream_frame(
+            "正在查询数据\n\n分析中...",
+            chat_id="chat1",
+            turn_id="turn1",
+            snapshot=True,
+        ) is True
+        assert await adapter.send_stream_frame(
+            "完整结论",
+            chat_id="chat1",
+            turn_id="turn1",
+            snapshot=True,
+        ) is True
+        assert await adapter.send_stream_frame(
+            "完整结论",
+            chat_id="chat1",
+            turn_id="turn1",
+            snapshot=True,
+            finalize=True,
+        ) is True
+
+        contents = [call.args[2] for call in client.reply_stream.await_args_list]
+        assert "正在查询数据\n\n分析中..." in contents
+        assert contents[-1].startswith("完整结论")
+        assert client.reply_stream.await_args.args[3] is True
