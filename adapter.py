@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import socket
@@ -74,7 +75,6 @@ try:
     from .media import (
         check_file_size,
         detect_media_type,
-        download_and_decrypt,
         apply_file_size_limits,
         resolve_media_file,
         upload_and_send_media,
@@ -118,7 +118,6 @@ except ImportError:
     from media import (  # type: ignore[no-redef]
         check_file_size,
         detect_media_type,
-        download_and_decrypt,
         apply_file_size_limits,
         resolve_media_file,
         upload_and_send_media,
@@ -255,11 +254,10 @@ class StreamTurn:
 class XWeComAdapter(BasePlatformAdapter):
     """WeCom adapter using official Python SDK."""
 
-    # GatewayStreamConsumer gates native streaming on this class attribute
-    # plus the supports_native_streaming() probe below.  WeCom's
-    # ``msgtype: "stream"`` is exactly the cumulative-text protocol the
-    # consumer expects: every frame carries the full response so far, the
-    # client diff-renders it, and ``finish=True`` closes the bubble.
+    # WeCom can't edit sent messages. Newer Hermes runtimes can route deltas
+    # through send_stream_frame(); older runtimes skip streaming because editing
+    # is disabled and deliver the final answer through send(reply_to=...).
+    SUPPORTS_MESSAGE_EDITING = False
     SUPPORTS_NATIVE_STREAMING = True
 
     def __init__(self, config: PlatformConfig):
@@ -294,6 +292,7 @@ class XWeComAdapter(BasePlatformAdapter):
             extra.get("reply_ack_timeout_s")
             or os.getenv("XWECOM_REPLY_ACK_TIMEOUT_S", "30")
         )
+        self._connect_timeout_s = float(extra.get("connect_timeout_s", 20.0))
         self._text_batch_delay_s = float(
             extra.get("text_batch_delay_s", TEXT_BATCH_DELAY_SECONDS)
         )
@@ -347,6 +346,7 @@ class XWeComAdapter(BasePlatformAdapter):
         # 846608, but lets already-active turns continue to finalize.
         self._last_chat_req_ids: Dict[str, str] = {}
         self._last_chat_frames: Dict[str, Dict[str, Any]] = {}
+        self._reply_frames: Dict[str, Dict[str, Any]] = {}
         self._stream_turns: Dict[str, StreamTurn] = {}
         self._stream_expired_chats: set = set()
         self._pending_text_batches: Dict[str, MessageEvent] = {}
@@ -362,6 +362,11 @@ class XWeComAdapter(BasePlatformAdapter):
         if isinstance(value, (list, tuple, set)):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
+
+    @property
+    def enforces_own_access_policy(self) -> bool:
+        """Tell Hermes that adapter-level allowlists were checked at intake."""
+        return True
 
     @staticmethod
     def _truthy(value: Any) -> bool:
@@ -480,6 +485,9 @@ class XWeComAdapter(BasePlatformAdapter):
             return True
         except Exception as e:
             logger.error(f"xwecom: connection failed - {e}")
+            set_fatal_error = getattr(self, "_set_fatal_error", None)
+            if callable(set_fatal_error):
+                set_fatal_error("xwecom_connect_error", str(e), retryable=True)
             await self._stop_callback_server()
             if self._client:
                 try:
@@ -502,26 +510,42 @@ class XWeComAdapter(BasePlatformAdapter):
             reply_ack_timeout=self._reply_ack_timeout_s,
         )
         self._client = WSClient(opts)
+        loop = asyncio.get_running_loop()
+        authenticated: asyncio.Future[None] = loop.create_future()
+
+        def on_authenticated() -> None:
+            logger.info("xwecom: authenticated successfully")
+            if not authenticated.done():
+                authenticated.set_result(None)
+
+        def on_error(error: Any) -> None:
+            logger.error(
+                "xwecom: error - %s",
+                error,
+                exc_info=isinstance(error, BaseException),
+            )
+            if not authenticated.done():
+                exc = error if isinstance(error, BaseException) else RuntimeError(str(error))
+                authenticated.set_exception(exc)
 
         # Bind event handlers
         self._client.on("message", self._on_message)
         self._client.on("event", self._on_event)
         self._client.on("connected", lambda: logger.info("xwecom: WebSocket connected"))
-        self._client.on(
-            "authenticated", lambda: logger.info("xwecom: authenticated successfully")
-        )
+        self._client.on("authenticated", on_authenticated)
         self._client.on(
             "disconnected",
             lambda reason="": logger.warning(f"xwecom: disconnected - {reason}"),
         )
-        self._client.on(
-            "error",
-            lambda e: logger.error(
-                f"xwecom: error - {e}", exc_info=isinstance(e, BaseException)
-            ),
-        )
+        self._client.on("error", on_error)
 
         await self._client.connect()
+        try:
+            await asyncio.wait_for(authenticated, timeout=self._connect_timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"WeCom authentication timed out after {self._connect_timeout_s:g}s"
+            ) from exc
         self._state.set_ws_client(self._account_id, self._client)
         self._state.set_connection_state(self._account_id, "connected")
 
@@ -534,6 +558,7 @@ class XWeComAdapter(BasePlatformAdapter):
         self._stream_turns.clear()
         self._last_chat_req_ids.clear()
         self._last_chat_frames.clear()
+        self._reply_frames.clear()
         self._stream_expired_chats.clear()
         for task in list(self._pending_text_batch_tasks.values()):
             task.cancel()
@@ -565,16 +590,21 @@ class XWeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a text message (proactive push via aibot_send_msg)."""
+        """Send text, preferring a passive reply bound to the inbound message."""
+        del metadata
         callback_app = self._resolve_callback_app_for_chat(chat_id)
         if callback_app is not None:
             return await self._send_callback_text(callback_app, chat_id, content)
 
         if not self._client:
+            agent_app = self._resolve_agent_app_for_chat(chat_id)
+            if agent_app is not None:
+                return await self._send_callback_text(agent_app, chat_id, content)
             return SendResult(success=False, error="Not connected")
 
         outbound_text = content
-        card_frame = self._build_outbound_frame(chat_id, reply_to)
+        reply_frame = self._reply_frame_for_message(reply_to)
+        card_frame = reply_frame or self._build_outbound_frame(chat_id, reply_to)
         try:
             card_result = await process_template_cards_if_needed(
                 self._client,
@@ -586,7 +616,7 @@ class XWeComAdapter(BasePlatformAdapter):
             if card_result is not None:
                 outbound_text = card_result.remaining_text
         except Exception as err:  # noqa: BLE001
-            logger.warning("xwecom: proactive template card send failed: %s", err)
+            logger.warning("xwecom: template card send failed: %s", err)
 
         outbound_text = await self._process_reply_media_directives(
             chat_id,
@@ -599,21 +629,86 @@ class XWeComAdapter(BasePlatformAdapter):
                 message_id=f"xwecom_{chat_id}_{int(time.time() * 1000)}",
             )
 
-        body = {"msgtype": "markdown", "markdown": {"content": outbound_text}}
         try:
-            resp = await self._client.send_message(chat_id, body)
-            errcode = resp.get("errcode", resp.get("data", {}).get("errcode", 0))
-            if errcode and errcode != 0:
-                errmsg = resp.get("errmsg", resp.get("data", {}).get("errmsg", ""))
-                return SendResult(success=False, error=f"errcode={errcode}: {errmsg}")
+            responses: List[Dict[str, Any]] = []
+            if reply_frame is not None:
+                chunks = self._split_text_by_byte_limit(
+                    outbound_text, MAX_STREAM_CONTENT_LENGTH
+                )
+                first = chunks.pop(0)
+                response = await self._client.reply_stream(
+                    reply_frame,
+                    f"stream_{uuid.uuid4().hex[:12]}",
+                    first,
+                    True,
+                )
+                responses.append(response)
+            else:
+                chunks = self._split_text_by_byte_limit(outbound_text, MAX_MESSAGE_LENGTH)
+
+            for chunk in chunks:
+                response = await self._client.send_message(
+                    chat_id,
+                    {"msgtype": "markdown", "markdown": {"content": chunk}},
+                )
+                responses.append(response)
+
+            for response in responses:
+                error = self._response_error(response)
+                if error:
+                    agent_app = self._resolve_agent_app_for_chat(chat_id)
+                    if agent_app is not None:
+                        logger.warning(
+                            "xwecom: Bot text send failed, falling back to Agent HTTP: %s",
+                            error,
+                        )
+                        return await self._send_callback_text(agent_app, chat_id, outbound_text)
+                    return SendResult(success=False, error=error, raw_response=response)
+
             msg_id = f"xwecom_{chat_id}_{int(time.time() * 1000)}"
-            return SendResult(success=True, message_id=msg_id)
+            return SendResult(success=True, message_id=msg_id, raw_response=responses)
         except RuntimeError as e:
             logger.error(f"xwecom send failed (not connected): {e}")
+            agent_app = self._resolve_agent_app_for_chat(chat_id)
+            if agent_app is not None:
+                return await self._send_callback_text(agent_app, chat_id, outbound_text)
             return SendResult(success=False, error=str(e))
         except Exception as e:
             logger.error(f"xwecom send failed: {e}")
+            agent_app = self._resolve_agent_app_for_chat(chat_id)
+            if agent_app is not None:
+                return await self._send_callback_text(agent_app, chat_id, outbound_text)
             return SendResult(success=False, error=str(e))
+
+    @staticmethod
+    def _response_error(response: Dict[str, Any]) -> Optional[str]:
+        payload = response.get("data") if isinstance(response.get("data"), dict) else {}
+        errcode = response.get("errcode", payload.get("errcode", 0))
+        if errcode in (0, None):
+            return None
+        errmsg = response.get("errmsg") or payload.get("errmsg") or "unknown error"
+        return f"errcode={errcode}: {errmsg}"
+
+    def _remember_reply_frame(self, message_id: str, frame: Dict[str, Any]) -> None:
+        key = str(message_id or "").strip()
+        req_id = str((frame.get("headers") or {}).get("req_id") or "").strip()
+        if not key or not req_id:
+            return
+        reply_frames = getattr(self, "_reply_frames", None)
+        if reply_frames is None:
+            reply_frames = {}
+            self._reply_frames = reply_frames
+        reply_frames[key] = frame
+        while len(reply_frames) > DEDUP_MAX_SIZE:
+            reply_frames.pop(next(iter(reply_frames)))
+
+    def _reply_frame_for_message(
+        self, reply_to: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        key = str(reply_to or "").strip()
+        if not key or key.startswith("quote:"):
+            return None
+        return getattr(self, "_reply_frames", {}).get(key)
 
     @staticmethod
     def _build_outbound_frame(
@@ -719,6 +814,8 @@ class XWeComAdapter(BasePlatformAdapter):
                 self._last_chat_frames.pop(drop, None)
             # A fresh inbound req_id resurrects the stream channel.
             self._stream_expired_chats.discard(chat_id)
+        if msg_id and req_id:
+            self._remember_reply_frame(msg_id, frame)
 
         # Access control
         if is_group:
@@ -736,52 +833,70 @@ class XWeComAdapter(BasePlatformAdapter):
                 logger.debug(f"xwecom: DM rejected by policy: {user_id}")
                 return
 
-        # Parse message content (handles text / image / mixed / quote / event)
-        text, images = self._parse_message_content(body)
+        # Parse message content (handles text / image / file / video / quote).
+        parsed = parse_message_content(body)
+        text = parsed.text
+        if not text and parsed.quote_content:
+            text = parsed.quote_content
+
+        media_refs: List[Tuple[str, str, str]] = []
+        media_refs.extend(
+            ("image", url, parsed.image_aes_keys.get(url, ""))
+            for url in parsed.image_urls
+        )
+        media_refs.extend(
+            ("file", url, parsed.file_aes_keys.get(url, ""))
+            for url in parsed.file_urls
+        )
 
         msgtype_log = body.get("msgtype", "?")
-        if images:
+        if media_refs:
             logger.info(
-                "xwecom: inbound media — msgtype=%s images=%d urls_present=%d aes_keys_present=%d",
+                "xwecom: inbound media — msgtype=%s attachments=%d aes_keys_present=%d",
                 msgtype_log,
-                len(images),
-                sum(1 for i in images if i.get("url")),
-                sum(1 for i in images if i.get("aes_key")),
+                len(media_refs),
+                sum(1 for _, _, aes_key in media_refs if aes_key),
             )
 
         # Download media attachments
-        cached_images: List[str] = []
-        for idx, img_info in enumerate(images):
-            url = img_info.get("url", "")
-            aes_key = img_info.get("aes_key") or img_info.get("aeskey") or ""
-            if not url:
-                logger.warning("xwecom: image %d has no url, skipping", idx)
-                continue
+        cached_media: List[str] = []
+        cached_types: List[str] = []
+        for idx, (kind, url, aes_key) in enumerate(media_refs):
             try:
-                img_data = await download_and_decrypt(self._client, url, aes_key)
-            except Exception as e:  # download_and_decrypt swallows but be safe
-                logger.warning("xwecom: image %d download exception: %s", idx, e)
-                img_data = None
-            if not img_data:
+                media_data, downloaded_name = await self._client.download_file(url, aes_key)
+            except Exception as e:
+                logger.warning("xwecom: attachment %d download failed: %s", idx, e)
+                media_data = None
+                downloaded_name = None
+            if not media_data:
                 logger.warning(
-                    "xwecom: image %d download returned no data (url=%s aes_key_len=%d)",
+                    "xwecom: attachment %d download returned no data (url=%s aes_key_len=%d)",
                     idx, url[:80], len(aes_key),
                 )
                 continue
-            if cache_image_from_bytes is None:
-                logger.warning("xwecom: cache_image_from_bytes unavailable in this Hermes build")
-                continue
-            # cache_image_from_bytes takes an EXTENSION (e.g. ".jpg"), not a filename.
-            fname = img_info.get("filename") or "image.png"
-            ext = os.path.splitext(fname)[1] or ".png"
+            filename = str(downloaded_name or os.path.basename(url.split("?", 1)[0]))
+            if not filename:
+                filename = "image.png" if kind == "image" else "wecom_file.bin"
+            mime_type = mimetypes.guess_type(filename)[0] or (
+                "image/jpeg" if kind == "image" else "application/octet-stream"
+            )
             try:
-                path = cache_image_from_bytes(img_data, ext)
+                if kind == "image":
+                    if cache_image_from_bytes is None:
+                        raise RuntimeError("cache_image_from_bytes unavailable")
+                    ext = os.path.splitext(filename)[1] or ".jpg"
+                    path = cache_image_from_bytes(media_data, ext)
+                else:
+                    if cache_document_from_bytes is None:
+                        raise RuntimeError("cache_document_from_bytes unavailable")
+                    path = cache_document_from_bytes(media_data, filename)
                 if path:
-                    cached_images.append(str(path))
-                    logger.info("xwecom: cached image %d -> %s (%d bytes)",
-                                idx, path, len(img_data))
+                    cached_media.append(str(path))
+                    cached_types.append(mime_type)
+                    logger.info("xwecom: cached attachment %d -> %s (%d bytes)",
+                                idx, path, len(media_data))
             except Exception as e:
-                logger.warning("xwecom: failed to cache image %d: %s (%d bytes)", idx, e, len(img_data))
+                logger.warning("xwecom: failed to cache attachment %d: %s", idx, e)
 
         # Build MessageEvent
         source = self.build_source(
@@ -793,16 +908,24 @@ class XWeComAdapter(BasePlatformAdapter):
         )
 
         msg_type = MessageType.TEXT
-        if cached_images and not text:
-            msg_type = MessageType.PHOTO
+        if cached_media and not text:
+            if any(mime.startswith("image/") for mime in cached_types):
+                msg_type = getattr(MessageType, "PHOTO", getattr(MessageType, "IMAGE", MessageType.TEXT))
+            elif msgtype == "voice":
+                msg_type = getattr(MessageType, "VOICE", MessageType.TEXT)
+            else:
+                msg_type = getattr(MessageType, "DOCUMENT", getattr(MessageType, "FILE", MessageType.TEXT))
 
         event = MessageEvent(
             text=text or "",
             message_type=msg_type,
             source=source,
+            raw_message=frame,
             message_id=msg_id,
-            media_urls=cached_images,
-            media_types=["image"] * len(cached_images),
+            media_urls=cached_media,
+            media_types=cached_types,
+            reply_to_message_id=str((body.get("quote") or {}).get("msgid") or "") or None,
+            reply_to_text=parsed.quote_content,
         )
 
         # Store frame ref for potential stream reply
@@ -1298,36 +1421,68 @@ class XWeComAdapter(BasePlatformAdapter):
     ) -> SendResult:
         if web is None or ClientSession is None:
             return SendResult(success=False, error="aiohttp is required for callback send")
-        touser = chat_id.split(":", 1)[1] if ":" in chat_id else chat_id
-        payload = {
-            "touser": touser,
-            "msgtype": "text",
-            "agentid": int(str(app.get("agent_id") or 0)),
-            "text": {"content": content[:2048]},
-            "safe": 0,
-        }
+        raw_target = chat_id
+        corp_prefix = f"{app.get('corp_id')}:"
+        if corp_prefix != ":" and raw_target.startswith(corp_prefix):
+            raw_target = raw_target[len(corp_prefix):]
+        target = _resolve_wecom_target(raw_target) or {"touser": raw_target}
         try:
-            for attempt in range(2):
-                token = await self._get_callback_access_token(app)
-                session = await self._ensure_callback_http_session()
-                async with session.post(
-                    "https://qyapi.weixin.qq.com/cgi-bin/message/send",
-                    params={"access_token": token},
-                    json=payload,
-                ) as resp:
-                    data = await resp.json(content_type=None)
-                errcode = data.get("errcode")
-                if errcode in {40001, 42001} and attempt == 0:
-                    self._callback_access_tokens.pop(str(app.get("name") or ""), None)
-                    continue
-                if errcode != 0:
-                    return SendResult(success=False, error=str(data), raw_response=data)
-                return SendResult(
-                    success=True,
-                    message_id=str(data.get("msgid") or ""),
-                    raw_response=data,
-                )
-            return SendResult(success=False, error="callback send failed after token refresh")
+            responses: List[Dict[str, Any]] = []
+            for chunk in self._split_text_by_byte_limit(content, 2048):
+                if target.get("chatid"):
+                    url = "https://qyapi.weixin.qq.com/cgi-bin/appchat/send"
+                    payload = {
+                        "chatid": target["chatid"],
+                        "msgtype": "text",
+                        "text": {"content": chunk},
+                    }
+                else:
+                    url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+                    payload = {
+                        key: value
+                        for key, value in {
+                            "touser": target.get("touser"),
+                            "toparty": target.get("toparty"),
+                            "totag": target.get("totag"),
+                        }.items()
+                        if value
+                    }
+                    payload.update(
+                        {
+                            "msgtype": "text",
+                            "agentid": int(str(app.get("agent_id") or 0)),
+                            "text": {"content": chunk},
+                            "safe": 0,
+                        }
+                    )
+                for attempt in range(2):
+                    token = await self._get_callback_access_token(app)
+                    session = await self._ensure_callback_http_session()
+                    async with session.post(
+                        url,
+                        params={"access_token": token},
+                        json=payload,
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                    errcode = data.get("errcode")
+                    if errcode in {40001, 42001} and attempt == 0:
+                        self._callback_access_tokens.pop(str(app.get("name") or ""), None)
+                        continue
+                    if errcode != 0:
+                        return SendResult(success=False, error=str(data), raw_response=data)
+                    responses.append(data)
+                    break
+                else:
+                    return SendResult(
+                        success=False,
+                        error="callback send failed after token refresh",
+                    )
+            last = responses[-1] if responses else {}
+            return SendResult(
+                success=True,
+                message_id=str(last.get("msgid") or f"agent_{int(time.time())}"),
+                raw_response=responses,
+            )
         except Exception as err:  # noqa: BLE001
             return SendResult(success=False, error=str(err))
 
@@ -1514,15 +1669,7 @@ class XWeComAdapter(BasePlatformAdapter):
         chat_type: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
-        """Probed by ``GatewayStreamConsumer`` to gate native streaming.
-
-        WeCom AI Bot supports ``msgtype: "stream"`` in both DMs and groups.
-        Whether we can actually send depends on having a cached inbound
-        ``req_id`` for the chat — that check happens inside
-        :meth:`send_stream_frame` when the consumer asks us to push a frame.
-        Returning ``True`` here just tells the consumer we *want* the
-        native transport.
-        """
+        """Enable WeCom streaming when the Hermes runtime supports the seam."""
         del chat_type, metadata
         return True
 
@@ -1535,7 +1682,7 @@ class XWeComAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         **kwargs,
     ) -> bool:
-        """Public entry-point for ``GatewayStreamConsumer``.
+        """Legacy direct WeCom stream entry-point, not called by Hermes.
 
         Lifecycle (per turn):
 
@@ -2283,6 +2430,176 @@ class XWeComAdapter(BasePlatformAdapter):
 
     # ── Media sending ───────────────────────────────────────────────────────
 
+    async def _send_media_source(
+        self,
+        chat_id: str,
+        media_source: str,
+        *,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Resolve, upload and send media through the Hermes adapter contract."""
+        callback_app = self._resolve_callback_app_for_chat(chat_id)
+        if callback_app is not None:
+            result = await self._send_agent_media(callback_app, chat_id, media_source)
+            if result.success and caption:
+                await self._send_callback_text(callback_app, chat_id, caption)
+            return result
+
+        if not self._client:
+            agent_app = self._resolve_agent_app_for_chat(chat_id)
+            if agent_app is not None:
+                return await self._send_agent_media(agent_app, chat_id, media_source)
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            media = await resolve_media_file(media_source, media_local_roots=None)
+            if file_name:
+                media.file_name = file_name
+            detected_type = detect_media_type(media.content_type, media.file_name)
+            size_check = apply_file_size_limits(
+                len(media.buffer), detected_type, media.content_type
+            )
+            if size_check.should_reject:
+                return SendResult(
+                    success=False,
+                    error=size_check.reject_reason or "Media rejected by WeCom limits",
+                )
+
+            media_id = await upload_media_chunked(
+                self._client,
+                media.buffer,
+                media.file_name,
+                size_check.final_type,
+            )
+            if not media_id:
+                return SendResult(success=False, error="Media upload failed")
+
+            body = {
+                "msgtype": size_check.final_type,
+                size_check.final_type: {"media_id": media_id},
+            }
+            reply_frame = self._reply_frame_for_message(reply_to)
+            if reply_frame is not None:
+                response = await self._client.reply(reply_frame, body)
+            else:
+                response = await self._client.send_message(chat_id, body)
+            error = self._response_error(response)
+            if error:
+                return SendResult(success=False, error=error, raw_response=response)
+
+            notes: List[str] = []
+            if caption:
+                notes.append(caption)
+            if size_check.downgraded and size_check.downgrade_note:
+                notes.append(size_check.downgrade_note)
+            note_result = None
+            if notes:
+                note_result = await self.send(chat_id, "\n\n".join(notes), reply_to=reply_to)
+
+            return SendResult(
+                success=True,
+                message_id=f"media_{media_id}",
+                raw_response={
+                    "media": response,
+                    "note": getattr(note_result, "raw_response", None),
+                },
+            )
+        except Exception as e:
+            logger.error("xwecom media send failed: %s", e)
+            agent_app = self._resolve_agent_app_for_chat(chat_id)
+            if agent_app is not None:
+                logger.warning("xwecom: falling back to Agent HTTP media send")
+                return await self._send_agent_media(agent_app, chat_id, media_source)
+            return SendResult(success=False, error=str(e))
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        del metadata
+        result = await self._send_media_source(
+            chat_id,
+            image_url,
+            caption=caption,
+            reply_to=reply_to,
+        )
+        if result.success or not image_url.startswith(("http://", "https://")):
+            return result
+        fallback = f"{caption}\n{image_url}" if caption else image_url
+        return await self.send(chat_id, fallback, reply_to=reply_to)
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id,
+            image_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id,
+            file_path,
+            caption=caption,
+            file_name=file_name,
+            reply_to=reply_to,
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id,
+            audio_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del kwargs
+        return await self._send_media_source(
+            chat_id,
+            video_path,
+            caption=caption,
+            reply_to=reply_to,
+        )
+
     async def send_media(
         self,
         chat_id: str,
@@ -2471,46 +2788,53 @@ async def _standalone_send_agent(
                 return {"error": f"Agent token refresh failed: {token_data}"}
             token = str(token_data["access_token"])
 
-            if target.get("chatid"):
-                url = "https://qyapi.weixin.qq.com/cgi-bin/appchat/send"
-                payload = {
-                    "chatid": target["chatid"],
-                    "msgtype": "text",
-                    "text": {"content": message[:2048]},
-                }
-            else:
-                url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
-                payload = {
-                    key: value
-                    for key, value in {
-                        "touser": target.get("touser"),
-                        "toparty": target.get("toparty"),
-                        "totag": target.get("totag"),
-                    }.items()
-                    if value
-                }
-                payload.update(
-                    {
+            responses: List[Dict[str, Any]] = []
+            for chunk in XWeComAdapter._split_text_by_byte_limit(message, 2048):
+                if target.get("chatid"):
+                    url = "https://qyapi.weixin.qq.com/cgi-bin/appchat/send"
+                    payload = {
+                        "chatid": target["chatid"],
                         "msgtype": "text",
-                        "agentid": int(str(app.get("agent_id") or 0)),
-                        "text": {"content": message[:2048]},
-                        "safe": 0,
+                        "text": {"content": chunk},
                     }
-                )
+                else:
+                    url = "https://qyapi.weixin.qq.com/cgi-bin/message/send"
+                    payload = {
+                        key: value
+                        for key, value in {
+                            "touser": target.get("touser"),
+                            "toparty": target.get("toparty"),
+                            "totag": target.get("totag"),
+                        }.items()
+                        if value
+                    }
+                    payload.update(
+                        {
+                            "msgtype": "text",
+                            "agentid": int(str(app.get("agent_id") or 0)),
+                            "text": {"content": chunk},
+                            "safe": 0,
+                        }
+                    )
 
-            async with session.post(
-                url,
-                params={"access_token": token},
-                json=payload,
-            ) as resp:
-                send_data = await resp.json(content_type=None)
-            if send_data.get("errcode") != 0:
-                return {"error": f"Agent send failed: {send_data}"}
-            message_id = str(send_data.get("msgid") or f"agent_{int(time.time())}")
+                async with session.post(
+                    url,
+                    params={"access_token": token},
+                    json=payload,
+                ) as resp:
+                    send_data = await resp.json(content_type=None)
+                if send_data.get("errcode") != 0:
+                    return {"error": f"Agent send failed: {send_data}"}
+                responses.append(send_data)
+
+            last_response = responses[-1] if responses else {}
+            message_id = str(
+                last_response.get("msgid") or f"agent_{int(time.time())}"
+            )
             return {
                 "success": True,
                 "message_id": message_id,
-                "raw_response": send_data,
+                "raw_response": responses,
                 "transport": "agent_http",
             }
     except Exception as err:  # noqa: BLE001

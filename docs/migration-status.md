@@ -1,14 +1,24 @@
 # xwecom 迁移状态记录
 
-更新时间：2026-07-02
+更新时间：2026-07-18
 
 ## 参考来源
 
-- `/Users/bilibili/.hermes/wecom-openclaw-plugin`：官方 OpenClaw TypeScript 插件，主要参考 `src/monitor.ts`、`src/message-parser.ts`、`src/message-sender.ts`、`src/media-uploader.ts`、`src/state-manager.ts`、`src/template-card-manager.ts`。
+- `/Users/bilibili/.hermes/workspace/wecom-openclaw-plugin`：官方 OpenClaw TypeScript 插件，主要参考 `src/monitor.ts`、`src/message-parser.ts`、`src/message-sender.ts`、`src/media-uploader.ts`、`src/state-manager.ts`、`src/template-card-manager.ts`。
 - `/Users/bilibili/.hermes/openclaw-plugin-wecom`：个人二开版本，主要参考 `wecom/ws-monitor.js` 的 keepalive、stream rotation、callback/event 修复，以及测试集中覆盖的 issue fixes。
 - `/Users/bilibili/.hermes/wecom-aibot-python-sdk-async`：官方 Python SDK，作为 `sdk/` WebSocket、API、AES 下载解密、基础类型定义的迁移来源。
 
 ## 本轮补齐
+
+- 明确 OpenClaw 与 Hermes 网关边界及版本差异：OpenClaw 插件拥有 LLM dispatch；jarvis 当前安装版 Hermes（`28c0f819`）已支持 `send_stream_frame()` native seam，而用于源码对照的 workspace Hermes（`d59b79f`）尚未包含该 seam。
+- 声明 `SUPPORTS_MESSAGE_EDITING = False` 和 `SUPPORTS_NATIVE_STREAMING = True`：新版 Hermes 走企微原生 stream；旧版 Hermes 跳过不可编辑预览并使用最终被动回复，避免半截消息和重复最终回复。
+- 建立 `message_id -> 原始 frame/req_id` 映射；Hermes 最终回复携带 `reply_to=message_id` 时使用 SDK `reply_stream(..., finish=True)` 被动回复。没有入站锚点的 cron/通知才使用 `aibot_send_msg` 主动发送。
+- 补齐 Hermes 实际调用的 `send_image`、`send_image_file`、`send_document`、`send_voice`、`send_video`，支持被动媒体回复与 Agent HTTP callback 路径。
+- 入站 WS 图片、文件、视频统一下载缓存，保留 MIME、`raw_message`、`reply_to_text` 和引用消息 ID。
+- WebSocket 连接等待 `authenticated` ACK 后才标记 ready；认证错误和超时会让连接失败并上报 fatal error。
+- `dm_policy=pairing` 不再在 adapter 内按 allowlist 提前丢弃，而是放行到 Hermes 核心生成/校验配对码；同时声明 adapter 自己执行 allowlist，避免 Hermes 对 config allowlist 二次拒绝。
+- Callback/Agent 文本按 UTF-8 字节边界分块，不再使用 `content[:2048]` 静默截断。
+- Bot WS 文本或媒体发送不可用时，自动降级到已配置的 Agent HTTP API；Agent 群聊目标使用 `appchat/send`。
 
 - `adapter.py` 接入 `state_manager`：连接成功后登记 WSClient 和连接状态；入站消息记录 `chat_id -> req_id`，供流式回复复用；断开时清理连接状态。
 - `adapter.py` 接入 `monitor`：普通消息通过 `run_with_message_timeout` 做处理超时保护，并用 `SessionRecorder` 标记 processing/finished/failed/timeout。
@@ -31,7 +41,7 @@
 ## 已有迁移覆盖
 
 - 消息解析：支持 text/image/voice/file/video/mixed/quote/location/link、mentions、template_card_event、auth_change_event。
-- 流式回复：`<think></think>` seed、120-360 字符句子分块、250ms idle flush、4 分钟 keepalive、5 分钟 stream rotation、85 个中间帧上限、20KB UTF-8 尾部截断、超长完整内容主动补发、846608 stream expired 标记和 fallback。
+- 流式/被动回复：兼容 native seam 的 Hermes 使用 `send_stream_frame()`；其他版本将最终文本绑定入站 `req_id` 被动回复。两条路径均按 UTF-8 字节限制处理内容，且不使用不可编辑的 preview/edit 流程。
 - 媒体：下载解密、URL/本地路径解析、MIME 类型检测、大小限制与降级、分块上传、主动媒体发送。
 - 回复媒体指令：识别 `MEDIA:/path` / `FILE:/path` 指令行，发送后从可见文本移除，失败时返回可见错误摘要。
 - Template Card：LLM 输出 JSON 检测、字段规整、主动/流式出站发送、缓存、template_card_event 后更新禁用态/选中态。
@@ -42,6 +52,10 @@
 
 ## 尚未完全迁移的 OpenClaw 专属能力
 
+- 官方 Bot HTTP webhook（加密 JSON、`stream_refresh` 轮询状态机）尚未移植；当前 HTTP callback 是自建应用 Agent 的加密 XML 通道。Hermes 若需要该模式，应实现独立 transport，并让 adapter `send()` 更新 webhook stream store。
+- 官方 `network.timeoutMs/retries/retryDelayMs/egressProxyUrl` 配置尚未移植；当前 WebSocket/HTTP 网络行为由 Python SDK、aiohttp 和进程环境决定。
+- workspace Hermes 若作为部署版本，需要先同步安装版已有的 native-stream seam；插件本身同时保留 native stream 与最终被动回复两条兼容路径。
+- 多账号路由按当前需求暂缓；本轮只保留现有单账号和 callback app 配置兼容性。
 - OpenClaw Core 的动态 agent routing、command allowlist、runtime telemetry、workspace template 不属于 Hermes platform adapter 的原生接口，本插件没有照搬。
 - OpenClaw 的群聊 callback 细分字段如果企业微信后续扩展 XML schema，本插件目前仍按现有 self-built app 用户消息 schema 解析；AI Bot WebSocket 群聊仍完整走 WS 通道。
 - OpenClaw 的独立 `dmContent` buffer 没有原样照搬；Hermes 版用 AI Bot WS `send_message` 分块补发完整内容。
@@ -53,4 +67,4 @@ python3 -m py_compile adapter.py tests/test_streaming.py tests/test_adapter_even
 python3 -m pytest tests/ -q
 ```
 
-当前结果：`236 passed in 1.58s`。
+当前结果：`259 passed`。

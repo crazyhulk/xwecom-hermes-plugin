@@ -30,6 +30,7 @@ def _make_adapter():
     adapter._groups_config = {}
     adapter._last_chat_req_ids = {}
     adapter._last_chat_frames = {}
+    adapter._reply_frames = {}
     adapter._stream_expired_chats = set()
     adapter._stream_turns = {}
     adapter._stream_gate = NonBlockingStreamGate()
@@ -54,6 +55,194 @@ def _make_adapter():
     adapter.build_source = MagicMock(return_value={})
     adapter.handle_message = AsyncMock()
     return adapter
+
+
+class TestHermesAdapterContract:
+    def test_disables_edit_streaming(self):
+        from adapter import XWeComAdapter
+
+        assert XWeComAdapter.SUPPORTS_MESSAGE_EDITING is False
+        assert XWeComAdapter.SUPPORTS_NATIVE_STREAMING is True
+
+    def test_declares_adapter_policy_enforcement(self):
+        adapter = _make_adapter()
+
+        assert adapter.enforces_own_access_policy is True
+
+    @pytest.mark.asyncio
+    async def test_reply_uses_original_frame_not_active_send(self):
+        adapter = _make_adapter()
+        frame = {
+            "headers": {"req_id": "REQ1"},
+            "body": {"msgid": "MSG1", "chatid": "chat1"},
+        }
+        adapter._reply_frames["MSG1"] = frame
+        adapter._client.reply_stream = AsyncMock(return_value={"errcode": 0})
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+
+        result = await adapter.send("chat1", "final answer", reply_to="MSG1")
+
+        assert result.success is True
+        adapter._client.reply_stream.assert_awaited_once()
+        assert adapter._client.reply_stream.await_args.args[0] is frame
+        assert adapter._client.reply_stream.await_args.args[2] == "final answer"
+        assert adapter._client.reply_stream.await_args.args[3] is True
+        adapter._client.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_text_falls_back_to_agent_when_bot_is_disconnected(self):
+        adapter = _make_adapter()
+        adapter._client = None
+        app = {
+            "name": "default",
+            "corp_id": "corp",
+            "corp_secret": "secret",
+            "agent_id": "1000002",
+        }
+        adapter._callback_apps = [app]
+        adapter._send_callback_text = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="AGENT1")
+        )
+
+        result = await adapter.send("alice", "hello")
+
+        assert result.success is True
+        adapter._send_callback_text.assert_awaited_once_with(app, "alice", "hello")
+
+    @pytest.mark.asyncio
+    async def test_media_falls_back_to_agent_when_bot_is_disconnected(self):
+        adapter = _make_adapter()
+        adapter._client = None
+        app = {
+            "name": "default",
+            "corp_id": "corp",
+            "corp_secret": "secret",
+            "agent_id": "1000002",
+        }
+        adapter._callback_apps = [app]
+        adapter._send_agent_media = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="MEDIA1")
+        )
+
+        result = await adapter.send_document("alice", "/tmp/report.pdf")
+
+        assert result.success is True
+        adapter._send_agent_media.assert_awaited_once_with(
+            app, "alice", "/tmp/report.pdf"
+        )
+
+    @pytest.mark.asyncio
+    async def test_document_method_uploads_and_passively_replies(self):
+        adapter = _make_adapter()
+        frame = {"headers": {"req_id": "REQ1"}, "body": {}}
+        adapter._reply_frames["MSG1"] = frame
+        adapter._client.reply = AsyncMock(return_value={"errcode": 0})
+        adapter._client.send_message = AsyncMock(return_value={"errcode": 0})
+        resolved = SimpleNamespace(
+            buffer=b"pdf",
+            content_type="application/pdf",
+            file_name="report.pdf",
+        )
+
+        with (
+            patch("adapter.resolve_media_file", AsyncMock(return_value=resolved)),
+            patch("adapter.upload_media_chunked", AsyncMock(return_value="MEDIA1")),
+        ):
+            result = await adapter.send_document(
+                "chat1", "/tmp/report.pdf", reply_to="MSG1"
+            )
+
+        assert result.success is True
+        adapter._client.reply.assert_awaited_once_with(
+            frame,
+            {"msgtype": "file", "file": {"media_id": "MEDIA1"}},
+        )
+        adapter._client.send_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_inbound_file_and_quote_are_preserved(self):
+        adapter = _make_adapter()
+        adapter._client.download_file = AsyncMock(
+            return_value=(b"hello", "notes.txt")
+        )
+        frame = {
+            "headers": {"req_id": "REQ1"},
+            "body": {
+                "msgid": "MSG1",
+                "msgtype": "file",
+                "chattype": "single",
+                "from": {"userid": "alice"},
+                "file": {"url": "https://example.test/file", "aeskey": "key"},
+                "quote": {
+                    "msgid": "QUOTED1",
+                    "msgtype": "text",
+                    "text": {"content": "quoted text"},
+                },
+            },
+        }
+
+        with patch("adapter.cache_document_from_bytes", return_value="/tmp/notes.txt"):
+            await adapter._dispatch_frame_as_message(frame)
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.raw_message is frame
+        assert event.media_urls == ["/tmp/notes.txt"]
+        assert event.media_types == ["text/plain"]
+        assert event.reply_to_message_id == "QUOTED1"
+        assert event.reply_to_text == "quoted text"
+        assert adapter._reply_frames["MSG1"] is frame
+
+    @pytest.mark.asyncio
+    async def test_connect_waits_for_authenticated_event(self):
+        adapter = _make_adapter()
+        adapter._bot_id = "bot"
+        adapter._secret = "secret"
+        adapter._ws_url = "wss://example.test"
+        adapter._reply_ack_timeout_s = 1.0
+        adapter._connect_timeout_s = 0.1
+
+        class FakeClient:
+            def __init__(self, options):
+                self.options = options
+                self.handlers = {}
+
+            def on(self, event, handler):
+                self.handlers[event] = handler
+
+            async def connect(self):
+                self.handlers["connected"]()
+                self.handlers["authenticated"]()
+
+        with patch("adapter.WSClient", FakeClient):
+            await adapter._connect_ws()
+
+        assert adapter._state.get_connection_state("acc") == "connected"
+
+    @pytest.mark.asyncio
+    async def test_connect_rejects_authentication_error(self):
+        adapter = _make_adapter()
+        adapter._account_id = "auth-error"
+        adapter._bot_id = "bot"
+        adapter._secret = "secret"
+        adapter._ws_url = "wss://example.test"
+        adapter._reply_ack_timeout_s = 1.0
+        adapter._connect_timeout_s = 0.1
+
+        class FakeClient:
+            def __init__(self, options):
+                self.handlers = {}
+
+            def on(self, event, handler):
+                self.handlers[event] = handler
+
+            async def connect(self):
+                self.handlers["error"](RuntimeError("bad credentials"))
+
+        with patch("adapter.WSClient", FakeClient):
+            with pytest.raises(RuntimeError, match="bad credentials"):
+                await adapter._connect_ws()
+
+        assert adapter._state.get_connection_state("auth-error") != "connected"
 
 
 class TestAdapterEventCallbacks:
@@ -435,6 +624,82 @@ class TestAdapterCallbackInbound:
         assert result.message_id == "OUT1"
         assert post_calls[0][1]["params"] == {"access_token": "ACCESS"}
         assert post_calls[0][1]["json"]["touser"] == "alice"
+
+    @pytest.mark.asyncio
+    async def test_callback_text_is_chunked_by_utf8_bytes(self):
+        adapter = _make_adapter()
+        app = {
+            "name": "default",
+            "corp_id": "wxCORP",
+            "corp_secret": "secret",
+            "agent_id": "1000002",
+        }
+        adapter._get_callback_access_token = AsyncMock(return_value="ACCESS")
+        chunks = []
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self, content_type=None):
+                return {"errcode": 0, "msgid": str(len(chunks))}
+
+        class FakeSession:
+            closed = False
+
+            def post(self, url, **kwargs):
+                chunks.append(kwargs["json"]["text"]["content"])
+                return FakeResponse()
+
+        adapter._callback_http_session = FakeSession()
+        content = "中文" * 800
+
+        result = await adapter._send_callback_text(app, "wxCORP:alice", content)
+
+        assert result.success is True
+        assert "".join(chunks) == content
+        assert len(chunks) > 1
+        assert all(len(chunk.encode("utf-8")) <= 2048 for chunk in chunks)
+
+    @pytest.mark.asyncio
+    async def test_callback_group_uses_appchat_endpoint(self):
+        adapter = _make_adapter()
+        app = {
+            "name": "default",
+            "corp_id": "wxCORP",
+            "corp_secret": "secret",
+            "agent_id": "1000002",
+        }
+        adapter._get_callback_access_token = AsyncMock(return_value="ACCESS")
+        calls = []
+
+        class FakeResponse:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def json(self, content_type=None):
+                return {"errcode": 0, "msgid": "GROUP1"}
+
+        class FakeSession:
+            closed = False
+
+            def post(self, url, **kwargs):
+                calls.append((url, kwargs))
+                return FakeResponse()
+
+        adapter._callback_http_session = FakeSession()
+
+        result = await adapter._send_callback_text(app, "group:wr123", "hello")
+
+        assert result.success is True
+        assert calls[0][0].endswith("/cgi-bin/appchat/send")
+        assert calls[0][1]["json"]["chatid"] == "wr123"
 
 
 class TestAdapterTextBatching:

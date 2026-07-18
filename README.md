@@ -70,15 +70,19 @@ gateway:
 ## Features
 
 - ✅ Official WeCom Python SDK (stable WebSocket, proper reconnection)
-- ✅ Streaming replies with sentence-aligned block chunking
-- ✅ Stream keepalive and proactive rotation before WeCom's 6-minute limit
-- ✅ Full-content fallback for stream replies that exceed WeCom frame limits
-- ✅ Stream expiry detection (errcode 846608) with graceful fallback
+- ✅ Passive replies bound to the inbound WeCom `req_id` (no active-send quota for normal replies)
+- ✅ Native WeCom streaming on compatible Hermes runtimes, with passive final-reply fallback
+- ✅ Hermes-compatible non-editing fallback (no partial/duplicate preview messages)
+- ✅ UTF-8 byte-safe text chunking without silent truncation
 - ✅ Media upload/download with AES decryption
+- ✅ Native Hermes image, document, voice, and video delivery methods
+- ✅ Inbound image/file/video caching with MIME and quote context preservation
 - ✅ Optional self-built app HTTP callback listener with crypto/XML verification
 - ✅ Callback inbound MediaId download/cache for image, voice, file, and video
 - ✅ Callback-mode proactive replies through WeCom Agent API
+- ✅ Bot-first, Agent HTTP fallback for text and media delivery
 - ✅ DM and Group access control policies
+- ✅ Hermes-owned DM pairing flow
 - ✅ Cron delivery support (standalone sender)
 - ✅ Token lock (multi-profile safety)
 - ✅ Message deduplication
@@ -95,6 +99,14 @@ pytest tests/ -v
 ```
 
 ## Architecture
+
+OpenClaw's official plugin owns both LLM dispatch and the original WeCom frame,
+so it can drive `replyStream` for every model delta. Hermes owns LLM dispatch in
+the gateway. Hermes runtimes with the native-stream seam call this adapter's
+`send_stream_frame()` for the full turn. Older runtimes do not call that method;
+because message editing is disabled, they skip partial previews and deliver the
+final response through `send(reply_to=message_id)`, which sends a passive WeCom
+stream reply (`finish=true`) correlated to the inbound frame.
 
 See [PLAN.md](./PLAN.md) for the full technical design document.
 See [docs/migration-status.md](./docs/migration-status.md) for the current

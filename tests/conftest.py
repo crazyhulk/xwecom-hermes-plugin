@@ -16,6 +16,8 @@ gateway_platforms_base = ModuleType("gateway.platforms.base")
 gateway_platforms_helpers = ModuleType("gateway.platforms.helpers")
 gateway_status = ModuleType("gateway.status")
 utils_mock = ModuleType("utils")
+pyee_mock = ModuleType("pyee")
+pyee_asyncio = ModuleType("pyee.asyncio")
 
 
 # Create mock classes
@@ -66,7 +68,23 @@ class MockMessageEvent:
 class MockMessageType:
     TEXT = "text"
     IMAGE = "image"
+    PHOTO = "photo"
     FILE = "file"
+    DOCUMENT = "document"
+    VOICE = "voice"
+
+
+class MockAsyncIOEventEmitter:
+    def __init__(self):
+        self._events = {}
+
+    def on(self, event, handler):
+        self._events.setdefault(event, []).append(handler)
+        return handler
+
+    def emit(self, event, *args):
+        for handler in self._events.get(event, []):
+            handler(*args)
 
 
 # Wire up mocks
@@ -82,6 +100,7 @@ gateway_platforms_helpers.MessageDeduplicator = MagicMock
 gateway_status.acquire_scoped_lock = MagicMock(return_value=True)
 gateway_status.release_scoped_lock = MagicMock()
 utils_mock.env_float = MagicMock(return_value=0.0)
+pyee_asyncio.AsyncIOEventEmitter = MockAsyncIOEventEmitter
 
 gateway_mock.config = gateway_config
 gateway_mock.platforms = gateway_platforms
@@ -95,3 +114,5 @@ sys.modules["gateway.platforms.base"] = gateway_platforms_base
 sys.modules["gateway.platforms.helpers"] = gateway_platforms_helpers
 sys.modules["gateway.status"] = gateway_status
 sys.modules["utils"] = utils_mock
+sys.modules.setdefault("pyee", pyee_mock)
+sys.modules.setdefault("pyee.asyncio", pyee_asyncio)

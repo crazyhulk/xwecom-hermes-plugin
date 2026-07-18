@@ -35,7 +35,7 @@ def check_dm_policy(
         - "open": accept all DMs
         - "allowlist": only accept from listed users
         - "disabled": reject all DMs
-        - "pairing": accept from listed users (same as allowlist for our purposes)
+        - "pairing": pass intake to Hermes, which owns pairing requests/codes
     """
     policy = policy.lower().strip()
 
@@ -43,7 +43,9 @@ def check_dm_policy(
         return False
     if policy == "open":
         return True
-    if policy in ("allowlist", "pairing"):
+    if policy == "pairing":
+        return True
+    if policy == "allowlist":
         return _entry_matches(allow_from, user_id)
 
     # Default: open

@@ -46,11 +46,11 @@ class TestDMPolicy:
 
         assert check_dm_policy("allowlist", ["User1"], "user1") is True
 
-    def test_pairing_same_as_allowlist(self):
+    def test_pairing_is_delegated_to_hermes(self):
         from policy import check_dm_policy
 
         assert check_dm_policy("pairing", ["user1"], "user1") is True
-        assert check_dm_policy("pairing", ["user1"], "user2") is False
+        assert check_dm_policy("pairing", ["user1"], "user2") is True
 
     def test_prefix_stripping(self):
         from policy import check_dm_policy

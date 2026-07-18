@@ -35,6 +35,7 @@ def _make_adapter():
     adapter._client = None
     adapter._last_chat_req_ids = {}
     adapter._last_chat_frames = {}
+    adapter._reply_frames = {}
     adapter._stream_turns = {}
     adapter._stream_expired_chats = set()
     adapter._stream_gate = NonBlockingStreamGate()
@@ -61,7 +62,7 @@ def _bind_chat(adapter, chat_id="chat1", req_id="REQ1"):
 
 
 class TestSupportsNativeStreaming:
-    """Class attribute + method probe used by ``GatewayStreamConsumer``."""
+    """Advertise native streaming to Hermes runtimes that support the seam."""
 
     def test_class_attribute_is_true(self):
         from adapter import XWeComAdapter
@@ -230,6 +231,10 @@ class TestIntermediateFrames:
         assert client.reply_stream.await_count > sent_before
         assert client.reply_stream.await_args.args[2] == long_text
         assert client.reply_stream.await_args.args[3] is False
+        turn = next(iter(adapter._stream_turns.values()))
+        turn.finalized = True
+        adapter._cancel_keepalive(turn)
+        await asyncio.sleep(0)
 
     async def test_rotation_finishes_old_stream_and_continues_with_delta(self):
         adapter = _make_adapter()

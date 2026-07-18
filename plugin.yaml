@@ -5,7 +5,7 @@ version: 1.0.0
 description: >
   WeCom (Enterprise WeChat) gateway adapter for Hermes Agent, powered by
   the official wecom-aibot-python-sdk-async. Provides stable WebSocket
-  connectivity, streaming replies, and media handling via the official
+  connectivity, native/passive replies, and media handling via the official
   protocol implementation maintained by the Tencent WeCom team.
 author: crazyhulk
 requires_env:
