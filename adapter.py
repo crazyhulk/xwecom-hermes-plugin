@@ -2118,29 +2118,19 @@ class XWeComAdapter(BasePlatformAdapter):
                 turn.chunker.mark_emitted(turn_text)
             return ok
 
-        # ── Intermediate frame via the block chunker ────────────────────
-        if turn.chunker is None:
-            turn.chunker = BlockChunker()
+        # ── Intermediate frame — no buffering (fire-and-forget) ─────────
         turn.pending_cumulative = turn_text
 
-        if turn.frame_count >= MAX_INTERMEDIATE_FRAMES:
-            # Frame cap reached — keep accumulating silently. The finalize
-            # frame will carry the rest.
+        # Only send if content actually changed from last wire frame.
+        if turn_text == turn.last_sent_content:
             return True
 
-        if turn.chunker.should_emit(turn_text):
-            self._cancel_idle_flush(turn)
-            ok = await self._send_stream_reply_frame(turn, turn_text, finish=False)
-            if not ok:
-                return False
-            turn.chunker.mark_emitted(turn_text)
-            turn.frame_count += 1
-            turn.last_sent_content = turn_text
-            return True
-
-        # Not ready to emit yet — arm idle flush so a quiet LLM still
-        # makes progress on the wire.
-        self._arm_idle_flush(turn, turn_id=turn_id)
+        self._cancel_idle_flush(turn)
+        ok = await self._send_stream_reply_frame(turn, turn_text, finish=False)
+        if not ok:
+            return False
+        turn.frame_count += 1
+        turn.last_sent_content = turn_text
         return True
 
     # ── Stream-turn helpers ─────────────────────────────────────────────────

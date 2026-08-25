@@ -180,18 +180,18 @@ class TestIntermediateFrames:
         assert args[3] is False  # finish=False
         assert args[2] == long_text  # cumulative content
 
-    async def test_short_text_holds_until_idle_flush(self):
+    async def test_short_text_sends_immediately_no_buffer(self):
         adapter = _make_adapter()
         client = MagicMock()
         client.reply_stream = AsyncMock(return_value={"errcode": 0})
         adapter._client = client
         _bind_chat(adapter)
         await adapter.send_stream_frame("", chat_id="chat1")
-        # A few chars — chunker should not emit.
+        # No buffering — short text should be sent immediately.
         ok = await adapter.send_stream_frame("hi", chat_id="chat1")
         assert ok is True
-        # Only the seed frame so far.
-        assert client.reply_stream.await_count == 1
+        # Seed frame + immediate "hi" frame = 2
+        assert client.reply_stream.await_count == 2
 
     async def test_pending_ack_skips_intermediate_frame(self):
         adapter = _make_adapter()
@@ -322,10 +322,10 @@ class TestFinalize:
 
 
 class TestFrameCap:
-    """Past ``MAX_INTERMEDIATE_FRAMES`` we silently drop intermediates
-    and let the finalize frame carry the rest."""
+    """With no-buffering mode, there is no frame cap — frames are always sent
+    regardless of frame_count (fire-and-forget)."""
 
-    async def test_intermediate_dropped_after_cap(self):
+    async def test_intermediate_sent_even_after_high_frame_count(self):
         from constants import MAX_INTERMEDIATE_FRAMES
 
         adapter = _make_adapter()
@@ -335,7 +335,7 @@ class TestFrameCap:
         _bind_chat(adapter)
         await adapter.send_stream_frame("", chat_id="chat1")  # seed
 
-        # Force the turn to the cap as if we already sent that many frames.
+        # Force a high frame count to prove there's no cap.
         turn = next(iter(adapter._stream_turns.values()))
         turn.frame_count = MAX_INTERMEDIATE_FRAMES
 
@@ -344,8 +344,9 @@ class TestFrameCap:
 
         long_text = "这是一段够长的文字。" * 60
         ok = await adapter.send_stream_frame(long_text, chat_id="chat1")
-        assert ok is True  # consumer keeps going; we just don't ship
-        assert client.reply_stream.await_count == 0
+        assert ok is True
+        # Frame is sent even past the old cap — no buffering.
+        assert client.reply_stream.await_count == 1
 
 
 class TestStreamExpiredErrcode:
