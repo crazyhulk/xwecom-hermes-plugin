@@ -1,120 +1,89 @@
 # xwecom-hermes-plugin
 
-WeCom (企业微信) platform adapter for [Hermes Agent](https://hermes-agent.nousresearch.com), using the official WeCom Python SDK.
+WeCom (企业微信) AI-bot adapter for [Hermes Agent](https://hermes-agent.nousresearch.com), shipped as a
+standalone plugin. It presents WeCom to Hermes as a **fully editable IM**, so Hermes uses the same
+delivery path it uses for Telegram/Slack — while every edit is rendered on WeCom's reply-stream bubbles.
 
 ## Why
 
-Heremes Agent 的 wecom 适配器实在是一言难尽。
+WeCom cannot edit a sent message. The built-in adapter works around that with a WeCom-specific
+"native streaming" path inside Hermes core, which is rarely exercised and hard to change upstream.
+This plugin takes the opposite approach and emulates the missing capabilities at the edge:
 
-## Installation
+| Hermes sees | How xwecom renders it on WeCom |
+|---|---|
+| `send(..., expect_edits)` returns an editable message | a live `msgtype: stream` bubble |
+| `edit_message(id, text)` | the bubble's content is replaced |
+| `edit_message(..., finalize=True)` | the bubble is closed (`finish: true`) |
+| a message that lives longer than 10 minutes | sealed at 9 min and continued in a fresh bubble, same id |
+| a message longer than one frame (20 KB) | spills over into further bubbles, no repeated text |
+| an edit after the message was closed | continues in a new bubble (WeCom would silently drop it) |
+| tool progress | an editable progress bubble with a live `⠹ terminal 37s` timer |
+| exec approval buttons | a clickable `button_interaction` card, updated in place after a click |
 
-```bash
-# Clone into Hermes plugins directory
-git clone git@github.com:crazyhulk/xwecom-hermes-plugin.git ~/.hermes/plugins/xwecom
+Measured against the live WeCom API (Nov 2026): several streams can be open at once on one inbound
+message; a stream has no frame-count cap (120 frames at 2/s were accepted); a stream expires 600 s after
+its first frame (`846608`), after which even the closing frame is rejected; updates to a finished stream
+are acknowledged with `errcode 0` but never rendered.
 
-# Install dependencies
-pip install -r ~/.hermes/plugins/xwecom/requirements.txt
-```
-
-## Configuration
-
-Set environment variables in `~/.hermes/.env`:
-
-```bash
-XWECOM_BOT_ID=bot_xxxxx
-XWECOM_SECRET=your_secret_here
-XWECOM_HOME_CHANNEL=chat_id_for_cron  # optional
-```
-
-Optional self-built app callback mode:
+## Install
 
 ```bash
-XWECOM_CALLBACK_ENABLED=true
-XWECOM_CALLBACK_PORT=8645
-XWECOM_CALLBACK_PATH=/wecom/callback
-XWECOM_CORP_ID=wwxxxxxxxx
-XWECOM_CORP_SECRET=corp_secret_for_replies
-XWECOM_AGENT_ID=1000002
-XWECOM_CALLBACK_TOKEN=callback_token
-XWECOM_ENCODING_AES_KEY=43_char_encoding_aes_key
+git clone -b v2 git@github.com:crazyhulk/xwecom-hermes-plugin.git /tmp/xwecom-src
+cp -r /tmp/xwecom-src/xwecom ~/.hermes/plugins/xwecom      # or <profile>/plugins/xwecom
+hermes plugins enable xwecom
 ```
 
-Or configure in `config.yaml`:
+Requires `aiohttp` and `httpx` in the Hermes environment (both ship with Hermes' messaging extra).
 
-```yaml
-gateway:
-  platforms:
-    xwecom:
-      enabled: true
-      extra:
-        bot_id: "bot_xxxxx"
-        secret: "your_secret"
-        dm_policy: "open"
-        group_policy: "open"
-        callback_enabled: false
+## Configure
+
+Credentials are read as `XWECOM_*` first, then the built-in adapter's `WECOM_*`, so an existing WeCom
+profile works without re-entering anything:
+
+```bash
+XWECOM_BOT_ID=...            # or WECOM_BOT_ID
+XWECOM_SECRET=...            # or WECOM_SECRET
+XWECOM_HOME_CHANNEL=...      # optional: cron / notification target
+XWECOM_DM_POLICY=pairing     # open | allowlist | pairing | disabled
+XWECOM_ALLOWED_USERS=...     # optional allowlist
 ```
-
-## Migrating from built-in wecom
-
-Disable the old adapter and enable xwecom:
 
 ```yaml
 gateway:
   platforms:
     wecom:
-      enabled: false
+      enabled: false   # one bot = one WebSocket: a second connection kicks the first
     xwecom:
       enabled: true
 ```
 
-## Features
+### Switching from the built-in `wecom` adapter
 
-- ✅ Official WeCom Python SDK (stable WebSocket, proper reconnection)
-- ✅ Passive replies bound to the inbound WeCom `req_id` (no active-send quota for normal replies)
-- ✅ Native WeCom streaming through Hermes' `send`/`edit_message` contract
-- ✅ Dynamic streaming capability: Bot WS streams, Agent HTTP falls back to one final reply
-- ✅ Continuous typing across commentary/tool progress, finalized by the final reply
-- ✅ UTF-8 byte-safe text chunking without silent truncation
-- ✅ Media upload/download with AES decryption
-- ✅ Native Hermes image, document, voice, and video delivery methods
-- ✅ Inbound image/file/video caching with MIME and quote context preservation
-- ✅ Optional self-built app HTTP callback listener with crypto/XML verification
-- ✅ Callback inbound MediaId download/cache for image, voice, file, and video
-- ✅ Callback-mode proactive replies through WeCom Agent API
-- ✅ Bot-first, Agent HTTP fallback for text and media delivery
-- ✅ DM and Group access control policies
-- ✅ Hermes-owned DM pairing flow
-- ✅ Cron delivery support (standalone sender)
-- ✅ Token lock (multi-profile safety)
-- ✅ Message deduplication
-- ✅ Rapid plain-text message batching for WeCom client-side splits
+- Disable `wecom` first — WeCom allows one WebSocket per bot, and the two adapters would kick each other.
+- Sessions are keyed by platform name, so chats start fresh conversations under `xwecom`.
+- Cron jobs delivering to `wecom` must be changed to `deliver=xwecom`.
 
-## Development
+## Layout
 
-```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
+```
+xwecom/
+├── adapter.py      # WebSocket connection, inbound parsing, access policy, register()
+├── emulation.py    # the editable-IM surface Hermes talks to (+ tool timer, approval cards)
+├── messages.py     # virtual message → chain of WeCom stream bubbles (rotation, spill, overlay)
+├── streaming.py    # one stream frame on the wire, ack tracking, coalescing, final-frame retry
+├── hooks.py        # pre/post_tool_call → tool timer of the right chat
+├── media.py        # inbound media decryption, outbound uploads
+├── send_queue.py   # per-chat FIFO + 30 msgs/min token bucket
+├── gateway_env.py  # env → config seeding (XWECOM_* with WECOM_* fallback)
+└── compat.py       # local stand-ins for core internals the plugin API does not publish
 ```
 
-## Architecture
+Only names listed in Hermes' published plugin API (`hermes_cli/data/plugin_api.json`) are imported
+directly; everything else goes through `compat.py`, which degrades instead of failing when core moves.
 
-OpenClaw's official plugin owns both LLM dispatch and the original WeCom frame,
-so its buffered dispatcher directly drives `replyStream` with one `streamId`.
-It has no `SUPPORTS_MESSAGE_EDITING` capability; that flag belongs to Hermes.
-This adapter translates Hermes' existing editable-message lifecycle into the
-official WeCom lifecycle: `send(metadata.expect_edits=true)` opens a stream and
-returns its `streamId` as the Hermes `message_id`, cumulative `edit_message()`
-calls update it, and `finalize=true` sends `finish=true`. Bot WS advertises this
-capability dynamically. Agent HTTP and unavailable passive-reply contexts reject
-previews so Hermes falls back to a single final response.
+## Tests
 
-See [PLAN.md](./PLAN.md) for the full technical design document.
-See [docs/migration-status.md](./docs/migration-status.md) for the current
-OpenClaw/Python SDK migration coverage and verification log.
-
-## License
-
-MIT
+```bash
+python -m pytest tests          # emulation core against a fake WeCom that models the measured API
+```

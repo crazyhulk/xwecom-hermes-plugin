@@ -1,0 +1,32 @@
+name: xwecom
+label: XWeCom (企业微信 AI Bot · full-capability)
+kind: platform
+version: 2.0.0
+description: >
+  WeCom (Enterprise WeChat) AI-bot adapter that presents WeCom to Hermes as a fully editable IM.
+  Reply streams back every editable message (live token streaming, editable tool-progress bubbles
+  with running timers, transparent 10-minute bubble rotation), and exec approvals render as
+  clickable template cards. Reads XWECOM_* env, falling back to the built-in adapter's WECOM_*.
+author: crazyhulk
+requires_env:
+  - name: XWECOM_BOT_ID
+    description: "WeCom AI bot ID (falls back to WECOM_BOT_ID)"
+    prompt: "WeCom bot ID"
+    password: false
+  - name: XWECOM_SECRET
+    description: "WeCom AI bot secret (falls back to WECOM_SECRET)"
+    prompt: "WeCom bot secret"
+    password: true
+optional_env:
+  - name: XWECOM_HOME_CHANNEL
+    description: "Default chat ID for cron / notification delivery"
+    prompt: "Home channel chat ID"
+    password: false
+  - name: XWECOM_ALLOWED_USERS
+    description: "Comma-separated WeCom user IDs allowed to talk to the bot"
+    prompt: "Allowed users"
+    password: false
+  - name: XWECOM_DM_POLICY
+    description: "DM policy: open | allowlist | pairing | disabled"
+    prompt: "DM policy"
+    password: false
