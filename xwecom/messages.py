@@ -49,6 +49,7 @@ class FrameOutcome:
     ok: bool
     expired: bool = False  # 846608 / 846604: this stream (or its req_id) can no longer be updated
     indeterminate: bool = False  # sent, but the ack never confirmed it
+    req_dead: bool = False  # 846604: the inbound req_id itself expired — nothing sent on it can render
 
 
 class StreamWire(Protocol):
@@ -78,6 +79,9 @@ class VirtualMessage:
     overlay: str = ""
     bubbles: list[Bubble] = field(default_factory=list)
     finalized: bool = False
+    confirmed_upto: int = 0  # body index an acked finish frame proved on screen
+    req_dead: bool = False  # a frame on this req_id got 846604: nothing more can render there
+    sealed_text: str = ""  # body[:sealed_upto] as it was when the chain was last sealed/closed
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     @property
@@ -131,20 +135,46 @@ class MessageBook:
                 and (req_id is None or m.req_id == req_id) and (chat_id is None or m.chat_id == chat_id)]
 
     # ── operations (Hermes-facing) ──────────────────────────────────────
-    async def create(self, chat_id: str, req_id: str, body: str, *, finalize: bool) -> Optional[VirtualMessage]:
+    def register(self, chat_id: str, req_id: str) -> VirtualMessage:
+        """A message with nothing on screen yet: findable at once, drawn by the first ``update``."""
         msg = VirtualMessage(message_id=f"xw_{uuid.uuid4().hex[:16]}", chat_id=chat_id, req_id=req_id)
         self._messages[msg.message_id] = msg
-        if not await self.update(msg, body, finalize=finalize):
+        return msg
+
+    def discard(self, msg: VirtualMessage) -> None:
+        self._messages.pop(msg.message_id, None)
+
+    async def create(self, chat_id: str, req_id: str, body: str, *, finalize: bool,
+                     overlay: str = "") -> Optional[VirtualMessage]:
+        msg = self.register(chat_id, req_id)
+        if not await self.update(msg, body, finalize=finalize, overlay=overlay):
             self._messages.pop(msg.message_id, None)
             return None
         return msg
 
-    async def update(self, msg: VirtualMessage, body: str, *, finalize: bool) -> bool:
+    async def update(self, msg: VirtualMessage, body: str, *, finalize: bool, overlay: Optional[str] = None) -> bool:
+        """Replace the body (and, when given, the overlay in the same frame)."""
         async with msg.lock:
             msg.body = body
+            if overlay is not None:
+                msg.overlay = overlay
             if finalize:
                 msg.overlay = ""
             ok = await self._render(msg, finish=finalize)
+            if ok and finalize:
+                msg.finalized = True
+            return ok
+
+    async def redraw(self, msg: VirtualMessage, compose: Callable[[], tuple[str, str]], *, finalize: bool = False,
+                     final_overlay: str = "") -> bool:
+        """Re-render from ``compose() -> (body, overlay)``, evaluated under the message lock so a
+        concurrent writer can never be overwritten by an older snapshot. ``final_overlay`` is drawn under the body on the finish frame only — it
+        never becomes part of ``body``, so the seal offsets stay valid for a later continuation."""
+        async with msg.lock:
+            msg.body, msg.overlay = compose()
+            if finalize:
+                msg.overlay = ""
+            ok = await self._render(msg, finish=finalize, final_overlay=final_overlay)
             if ok and finalize:
                 msg.finalized = True
             return ok
@@ -190,11 +220,20 @@ class MessageBook:
                 del self._messages[mid]
 
     # ── rendering ───────────────────────────────────────────────────────
-    async def _render(self, msg: VirtualMessage, *, finish: bool) -> bool:
+    async def _render(self, msg: VirtualMessage, *, finish: bool, final_overlay: str = "") -> bool:
         live = msg.live
         if live is None:
             start = min(msg.sealed_upto, len(msg.body))
-            if msg.bubbles and start >= len(msg.body):
+            known = msg.sealed_text[:start]
+            if len(known) == start and msg.body[:start] != known:
+                start = 0  # the edit rewrote text that is already sealed: show the new text whole
+        # KNOWN GAP (pre-existing, not handled): this check covers a CLOSED chain only. While a chain is
+        # still open, a body whose prefix changed under a bubble that was already sealed by spill
+        # (``cut_point``) or by rotation (``_rotate``) is rendered from ``live.offset`` on — the sealed
+        # bubble keeps the old prefix and the live bubble shows the new text from the same offset, so the
+        # two read as garbled. Hermes' edit streams only append, and the turn bubble only appends segments,
+        # so it does not arise there; a non-append edit to a long or >9-min open message would hit it.
+            if msg.bubbles and start >= len(msg.body) and not final_overlay:
                 return True  # every byte of the body is already on screen in sealed bubbles
             live = self._open(msg, start)
         # A body longer than one frame: seal full chunks and continue in new bubbles.
@@ -206,13 +245,15 @@ class MessageBook:
             if not await self._seal(msg, live, live.offset + cut):
                 return False
             live = self._open(msg, live.offset + cut)
-        return await self._send_live(msg, live, finish=finish)
+        return await self._send_live(msg, live, finish=finish, final_overlay=final_overlay)
 
-    async def _send_live(self, msg: VirtualMessage, live: Bubble, *, finish: bool, retried: bool = False) -> bool:
+    async def _send_live(self, msg: VirtualMessage, live: Bubble, *, finish: bool, retried: bool = False,
+                         final_overlay: str = "") -> bool:
         body = msg.body[live.offset:]
         content = body
-        if msg.overlay and not finish:
-            content = f"{body}{OVERLAY_RULE}{msg.overlay}" if body else msg.overlay
+        overlay = final_overlay if finish else msg.overlay
+        if overlay:
+            content = f"{body}{OVERLAY_RULE}{overlay}" if body else overlay
         if not content:
             content = "" if finish else THINKING_SEED
         if content == live.shown:
@@ -220,6 +261,9 @@ class MessageBook:
                 return True
             content += ZWSP  # WeCom silently drops a final frame identical to the previous one
         outcome = await self._wire.stream_frame(msg.req_id, live.stream_id, content, finish=finish)
+        if outcome.req_dead:
+            live.closed = msg.req_dead = True  # nothing sent on this req_id renders: deliver another way
+            return False
         if outcome.expired:
             # The bubble died (wall reached, or a dead req_id). What it showed stays on screen; continue
             # the unshown rest in ONE fresh bubble. A dead req_id expires that one too → report failure so
@@ -229,10 +273,14 @@ class MessageBook:
                 return False
             if finish and live.end >= len(msg.body):
                 return True  # everything was already on screen; nothing to continue
-            return await self._send_live(msg, self._open(msg, live.end), finish=finish, retried=True)
+            return await self._send_live(msg, self._open(msg, live.end), finish=finish, retried=True,
+                                         final_overlay=final_overlay)
         if not outcome.ok:
             return False
         live.shown, live.shown_upto = content, len(msg.body)
+        if finish:
+            msg.confirmed_upto = len(msg.body)
+            msg.sealed_text = msg.body
         live.closed = finish
         return True
 
@@ -248,8 +296,12 @@ class MessageBook:
             content += ZWSP
         outcome = await self._wire.stream_frame(msg.req_id, bubble.stream_id, content, finish=True)
         bubble.closed = True
+        if outcome.req_dead:
+            msg.req_dead = True
+            return False
         if outcome.ok:
             bubble.shown, bubble.shown_upto = content, upto
+            msg.sealed_text = msg.body[:upto]
             return True
         # An expired bubble keeps what it last showed; carry on from there. Any other failure is real.
         logger.warning("[xwecom] sealing bubble %s failed (expired=%s)", bubble.stream_id, outcome.expired)

@@ -1,16 +1,24 @@
 """WeCom reply-stream wire: one ``msgtype: stream`` frame on the ``aibot_respond_msg`` command, with
 per-req_id ack tracking.
 
-WeCom acks a reply frame with a message carrying only the inbound ``req_id`` (no frame id), so at most one
-frame per req_id may wait for an ack at a time; anything else could not tell which frame an ack proves.
+WeCom acks a reply frame with a message carrying only the inbound ``req_id`` (no frame id, no stream id),
+and several streams may be open on one req_id at once (a turn bubble plus other bubbles of the same
+reply). Acks arrive in send order on the one connection (measured: every frame — final or not — gets
+exactly one ``errcode`` ack, in order), so correlation is strictly FIFO per req_id:
 
-* Intermediate frames are fire-and-forget. While a frame is waiting for its ack, a newer intermediate is
-  *coalesced* (the latest cumulative snapshot wins) and flushed when that ack arrives. Dropping instead
-  froze the bubble on a stale prefix under ack lag.
-* A final frame raises the *finalizing fence* (no coalesced successor may take the ack slot), drains the
-  pending ack, sends, and awaits its own ack. On a timeout it re-sends the identical frame once: the same
-  stream id + content is idempotent within the stream's window. Two timeouts mean the delivery is
-  indeterminate, and the req_id is *poisoned*: a late ack can never again prove a later frame.
+* every frame sent on a req_id appends a waiter to that req_id's FIFO; each ack resolves the OLDEST
+  waiter. No frame is ever refused or held back for an ack (the old design kept ONE pending slot per
+  req_id; a confirmed frame then waited behind — and was resolved by — another stream's ack, timed out,
+  and *poisoned* the req_id, after which every later intermediate frame was skipped and the turn bubble
+  froze).
+* intermediate frames are fire-and-forget: nothing awaits their waiter.
+* only a FINISH frame awaits its own waiter (``REPLY_ACK_TIMEOUT``), as before the turn bubble; every
+  other frame — every redraw of a live bubble — is fire-and-forget, whatever the ack state.
+  A finish frame A timeout leaves its slot in
+  the FIFO marked *timed out*: the late ack that eventually comes resolves that slot (and nothing else),
+  so the order stays aligned. A timeout only makes THAT frame's delivery indeterminate — drawing never
+  stops; there is no poisoning.
+* ``_resolve_reply_ack`` with no waiter outstanding is an unrouted payload (returns False).
 
 Errcodes: 846608 stream older than 10 minutes, 846604 req_id expired, 846609 subscription lost,
 6000 a newer frame already replaced this one (benign for a final).
@@ -19,11 +27,11 @@ Errcodes: 846608 stream older than 10 minutes, 846604 req_id expired, 846609 sub
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import collections
 import logging
 import time
-from dataclasses import dataclass
-from typing import Any, Optional
+from dataclasses import dataclass, field
+from typing import Any
 
 from .messages import FrameOutcome
 
@@ -39,6 +47,9 @@ STREAM_VERSION_CONFLICT_ERRCODE = 6000
 EXPIRED_ERRCODES = (STREAM_EXPIRED_ERRCODE, STREAM_REQUEST_EXPIRED_ERRCODE)
 MAX_STREAM_CONTENT_LENGTH = 20480  # bytes per frame, server-enforced
 REPLY_ACK_TIMEOUT = 15.0  # official REPLY_SEND_TIMEOUT_MS
+# An ack never came for this long: the slot is dropped from the FIFO head (a lost ack must not shift every
+# later correlation forever). Far past REPLY_ACK_TIMEOUT; measured late acks arrive within ~6s.
+STALE_ACK_SECONDS = 120.0
 
 
 @dataclass
@@ -49,19 +60,15 @@ class ReplyFrame:
     sent_at: float = 0.0
 
 
+@dataclass
 class ReplyQueue:
-    """Ack bookkeeping for one inbound req_id."""
-
-    def __init__(self, req_id: str):
-        self.req_id = req_id
-        self.pending_ack: Optional[ReplyFrame] = None
-        self.coalesced_body: Optional[dict[str, Any]] = None
-        self.finalizing = False
-        self.ack_poisoned = False
+    """The frames sent on one inbound req_id whose ack has not arrived yet, oldest first."""
+    req_id: str
+    waiters: collections.deque = field(default_factory=collections.deque)
 
     @property
     def idle(self) -> bool:
-        return self.pending_ack is None and self.coalesced_body is None and not self.finalizing and not self.ack_poisoned
+        return not self.waiters
 
 
 def truncate_utf8(content: str, limit: int = MAX_STREAM_CONTENT_LENGTH) -> str:
@@ -76,6 +83,8 @@ class StreamWireMixin:
 
     # ── messages.StreamWire ─────────────────────────────────────────────
     async def stream_frame(self, req_id: str, stream_id: str, content: str, *, finish: bool) -> FrameOutcome:
+        """Intermediate frames return at once (never awaited, never skipped); a finish frame reports its ack:
+        delivered, dead req_id (846604), expired stream (846608) or indeterminate (no ack in time)."""
         body = {"msgtype": "stream", "stream": {"id": stream_id, "finish": bool(finish), "content": truncate_utf8(content)}}
         try:
             if not finish:
@@ -86,6 +95,10 @@ class StreamWireMixin:
             logger.warning("[%s] stream frame failed (req_id=%s finish=%s): %s", self.name, req_id, finish, exc)
             return FrameOutcome(ok=False)
         errcode = response.get("errcode", 0)
+        if errcode in (STREAM_REQUEST_EXPIRED_ERRCODE, STREAM_NOT_SUBSCRIBED_ERRCODE):
+            # 846604 req_id expired; 846609 subscription lost (kicked / reconnected): nothing sent on this
+            # req_id renders any more either way.
+            return FrameOutcome(ok=False, expired=True, req_dead=True)
         if errcode in EXPIRED_ERRCODES:
             return FrameOutcome(ok=False, expired=True)
         if response.get("errmsg") == "settlement_indeterminate":
@@ -97,100 +110,65 @@ class StreamWireMixin:
 
     # ── ack-tracked send ────────────────────────────────────────────────
     async def _send_reply_queued(self, req_id: str, body: dict[str, Any], *, is_final: bool) -> dict[str, Any]:
+        """Send one reply frame on *req_id*. Intermediates return at once; a final frame awaits its own ack,
+        re-sending the identical frame once on a timeout (same stream id + content is idempotent within the
+        stream's window)."""
         self._require_ws()
-        queue = self._reply_queues.setdefault(req_id, ReplyQueue(req_id))
         if not is_final:
-            if queue.finalizing or queue.ack_poisoned:
-                return {"skipped": True, "errcode": 0}
-            if queue.pending_ack is not None:
-                queue.coalesced_body = body  # flushed by _resolve_reply_ack
-                return {"skipped": True, "errcode": 0, "errmsg": "coalesced"}
-            await self._dispatch_reply_frame(queue, body, is_final=False)
+            await self._dispatch_reply_frame(req_id, body, is_final=False)
             return {"errcode": 0, "errmsg": "sent_nonblocking"}
-        queue.finalizing = True
+        for attempt in (1, 2):
+            frame = await self._dispatch_reply_frame(req_id, body, is_final=True)
+            try:
+                return await asyncio.wait_for(asyncio.shield(frame.future), timeout=self._REPLY_ACK_TIMEOUT)
+            except asyncio.TimeoutError:
+                # The slot stays in the FIFO: its late ack must resolve IT, not the next frame's waiter.
+                logger.warning("[%s] final frame ack timeout (req_id=%s, attempt %d)", self.name, req_id, attempt)
+        return {"errcode": 0, "errmsg": "settlement_indeterminate"}
+
+    async def _dispatch_reply_frame(self, req_id: str, body: dict[str, Any], *, is_final: bool) -> ReplyFrame:
+        """Register the frame's waiter BEFORE sending (an ack can beat the send's return)."""
+        queue = self._reply_queues.setdefault(req_id, ReplyQueue(req_id))
+        frame = ReplyFrame(body=body, future=asyncio.get_running_loop().create_future(), is_final=is_final,
+                           sent_at=time.monotonic())
+        queue.waiters.append(frame)
         try:
-            if queue.pending_ack is not None:
-                await self._drain_pending_ack(queue)
-            if queue.ack_poisoned:
-                # Send anyway, but no ack on this req_id can prove it any more.
-                await self._send_json({"cmd": APP_CMD_RESPONSE, "headers": {"req_id": req_id}, "body": body})
-                return {"errcode": 0, "errmsg": "settlement_indeterminate"}
-            for attempt in (1, 2):
-                frame = await self._dispatch_reply_frame(queue, body, is_final=True)
-                try:
-                    return await asyncio.wait_for(frame.future, timeout=self._REPLY_ACK_TIMEOUT)
-                except asyncio.TimeoutError:
-                    logger.warning("[%s] final frame ack timeout (req_id=%s, attempt %d)", self.name, req_id, attempt)
-                finally:
-                    self._release_pending(queue, frame)
-                    if attempt == 2:
-                        queue.ack_poisoned = True  # an ack for either attempt may still arrive
-            return {"errcode": 0, "errmsg": "settlement_indeterminate"}
-        finally:
-            queue.finalizing = False
+            await self._send_json({"cmd": APP_CMD_RESPONSE, "headers": {"req_id": req_id}, "body": body})
+        except Exception:
+            # Never on the wire: no ack will come for it.
+            if frame in queue.waiters:
+                queue.waiters.remove(frame)
+            frame.future.cancel()
             if queue.idle:
                 self._reply_queues.pop(req_id, None)
-
-    async def _dispatch_reply_frame(self, queue: ReplyQueue, body: dict[str, Any], *, is_final: bool) -> ReplyFrame:
-        """Register the frame as the pending ack BEFORE sending (an ack can beat the send's return)."""
-        frame = ReplyFrame(body=body, future=asyncio.get_running_loop().create_future(), is_final=is_final, sent_at=time.monotonic())
-        self._reply_queues[queue.req_id] = queue
-        queue.pending_ack = frame
-        try:
-            await self._send_json({"cmd": APP_CMD_RESPONSE, "headers": {"req_id": queue.req_id}, "body": body})
-        except Exception:
-            self._release_pending(queue, frame)
-            frame.future.cancel()
             raise
         return frame
 
-    async def _drain_pending_ack(self, queue: ReplyQueue) -> None:
-        pending = queue.pending_ack
-        try:
-            await asyncio.wait_for(asyncio.shield(pending.future), timeout=self._REPLY_ACK_TIMEOUT)
-        except asyncio.TimeoutError:
-            queue.ack_poisoned = True
-            pending.future.cancel()
-            logger.warning("[%s] ack timeout draining a pending frame (req_id=%s)", self.name, queue.req_id)
-        except Exception:
-            pass
-        queue.pending_ack = None
-        queue.coalesced_body = None  # the final supersedes any buffered intermediate
-
-    def _release_pending(self, queue: ReplyQueue, frame: ReplyFrame) -> None:
-        if queue.pending_ack is frame:
-            queue.pending_ack = None
-        if queue.idle:
-            self._reply_queues.pop(queue.req_id, None)
-
     def _resolve_reply_ack(self, req_id: str, payload: dict[str, Any]) -> bool:
-        """Route an ack to its pending frame; True when handled."""
+        """Route an ack to the oldest frame on *req_id* still waiting for one; True when handled."""
         queue = self._reply_queues.get(req_id)
-        if queue is not None and queue.ack_poisoned:
-            return True  # uncorrelatable late ack
-        if queue is None or queue.pending_ack is None:
+        if queue is None:
             return False
-        frame = queue.pending_ack
+        now = time.monotonic()
+        while len(queue.waiters) > 1 and now - queue.waiters[0].sent_at > STALE_ACK_SECONDS:
+            lost = queue.waiters.popleft()  # its ack never came: realign on the frames after it
+            logger.warning("[%s] no ack for a frame sent %.0fs ago on req_id=%s; dropped from the ack order",
+                           self.name, now - lost.sent_at, req_id)
+            if not lost.future.done():
+                lost.future.set_result({"errcode": 0, "errmsg": "settlement_indeterminate"})
+        if not queue.waiters:
+            self._reply_queues.pop(req_id, None)
+            return False
+        frame = queue.waiters.popleft()
         if not frame.future.done():
             frame.future.set_result(payload)
-        queue.pending_ack = None
-        if queue.coalesced_body is not None:
-            with contextlib.suppress(RuntimeError):
-                asyncio.get_running_loop().create_task(self._flush_coalesced(req_id))
-        elif not queue.finalizing:
+        if queue.idle:
             self._reply_queues.pop(req_id, None)
         return True
 
-    async def _flush_coalesced(self, req_id: str) -> None:
-        queue = self._reply_queues.get(req_id)
-        if queue is None or queue.coalesced_body is None or queue.pending_ack is not None or queue.finalizing or queue.ack_poisoned:
-            return
-        body, queue.coalesced_body = queue.coalesced_body, None
-        with contextlib.suppress(Exception):  # a cumulative snapshot the next frame supersedes anyway
-            await self._dispatch_reply_frame(queue, body, is_final=False)
-
     def _fail_reply_queues(self, error: Exception) -> None:
         for queue in self._reply_queues.values():
-            if queue.pending_ack and not queue.pending_ack.future.done():
-                queue.pending_ack.future.set_exception(error)
+            for frame in queue.waiters:
+                if not frame.future.done():
+                    frame.future.set_exception(error)
         self._reply_queues.clear()

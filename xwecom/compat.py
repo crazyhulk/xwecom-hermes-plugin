@@ -99,3 +99,102 @@ def standalone_send_policy() -> Any:
         return StandaloneSendPolicy(text_direct=True)
     except Exception:
         return None
+
+
+def source_session_key(adapter: Any, source: Any) -> str:
+    """The adapter-level session key of an inbound source (``BasePlatformAdapter._source_session_key``:
+    chat, + sender in per-user group sessions). That method is core-private (not in plugin_api.json);
+    fall back to the same shape from the source's own fields."""
+    try:
+        return str(adapter._source_session_key(source))
+    except Exception:
+        chat, chat_type = getattr(source, "chat_id", ""), str(getattr(source, "chat_type", "") or "")
+        return f"{chat}:{getattr(source, 'user_id', '')}" if chat_type == "group" else str(chat)
+
+
+# English copies of the core status templates the turn bubble folds (``locales/en.yaml``), used when
+# ``agent.i18n`` is unavailable. Placeholders are matched as wildcards.
+_STATUS_TEMPLATES_EN = {
+    "gateway.progress.working_heartbeat": "⏳ Working — {minutes} min{detail}",
+    "gateway.progress.stuck_warning": "⚠️ I seem to be stuck (no activity for {minutes} min). If nothing happens in the next {remaining} min I'll give up on this task. You can keep waiting, send /stop to cancel it, or /new to start a fresh conversation.",
+    "gateway.exec_approval.timed_out_notice": "⌛ Approval timed out after {window} — the command was NOT run. Ask me to try again if you still want it, or raise approvals.timeout in config.yaml.",
+    "gateway.busy.drain_queued": "⏳ Gateway {action} — queued for the next turn after it comes back.",
+    "gateway.busy.drain_rejected": "⏳ Gateway is {action} and is not accepting another turn right now.",
+    "gateway.busy.drain_rejected_new_work": "⏳ Gateway is {action} and is not accepting new work right now.",
+    "gateway.busy.steered_subagents_head": "⏩ Steered into current run and its active subagent(s)",
+    "gateway.busy.steered_subagents_tail": ". Your message arrives after their next tool call.",
+    "gateway.busy.steered_head": "⏩ Steered into current run",
+    "gateway.busy.steered_tail": ". Your message arrives after the next tool call.",
+    "gateway.busy.redirected_head": "↪ Redirected current run",
+    "gateway.busy.redirected_tail": ". I'll adjust using your correction.",
+    "gateway.busy.subagent_working_head": "⏳ Subagent working",
+    "gateway.busy.compressing_head": "⏳ Compressing context",
+    "gateway.busy.demoted_tail": " — your message is queued for when it finishes (use /stop to cancel everything).",
+    "gateway.busy.queued_head": "⏳ Queued for the next turn",
+    "gateway.busy.queued_tail": ". I'll respond once the current task finishes.",
+    "gateway.busy.interrupting_head": "⚡ Interrupting current task",
+    "gateway.busy.interrupting_tail": ". I'll respond to your message shortly.",
+}
+
+
+def core_templates(key: str) -> list[str]:
+    """The raw (unformatted) core template for *key*: the active language's and English. Read through
+    ``agent.i18n.t`` (core-private) with the local English copy as fallback."""
+    out: list[str] = []
+    try:
+        from agent.i18n import t as core_t
+        for lang in (None, "en"):
+            text = core_t(key) if lang is None else core_t(key, lang=lang)
+            if text and text != key and text not in out:
+                out.append(text)
+    except Exception:
+        pass
+    fallback = _STATUS_TEMPLATES_EN.get(key)
+    if fallback and fallback not in out:
+        out.append(fallback)
+    return out
+
+
+
+
+# Core sends its status surfaces from these coroutines (``asyncio.current_task()`` is the coroutine that
+# issued the adapter call): the tool-progress lane (``TurnRunner.send_progress_messages``, gateway/
+# run_turn_progress.py) and agent status lines such as the memory-recall indicator
+# (``_send_or_update_status_coro``, gateway/run.py). Identified by the call path, not by text; a core rename
+# simply stops the folding (the message gets its own bubble, as without the plugin's turn bubble).
+_PROGRESS_LANE = "send_progress_messages"
+_STATUS_LANE = "_send_or_update_status_coro"
+
+
+def core_send_lane() -> str:
+    """"progress" | "status" | "" — which core status lane the current adapter call comes from."""
+    try:
+        import asyncio
+        task = asyncio.current_task()
+        name = task.get_coro().cr_code.co_name if task is not None else ""
+    except Exception:
+        return ""
+    return {_PROGRESS_LANE: "progress", _STATUS_LANE: "status"}.get(name, "")
+
+
+def tool_line_prefixes(tool_name: str) -> tuple[str, ...]:
+    """How core's tool-progress line for *tool_name* starts (gateway/run_turn_progress.py
+    ``_progress_build_message``): ``{emoji} {tool}`` (pending / preview / verbose / terminal-block header) or
+    ``{emoji} {friendly verb}``. The emoji is the published ``tools.registry`` one (core's "⚙️" default);
+    the verb comes from core-private ``agent.display`` (no fallback: without it a verb line just stays
+    unmatched and the call keeps its bare label)."""
+    emoji = "⚙️"
+    try:
+        from tools.registry import registry
+        emoji = registry.get_emoji(tool_name, default="") or "⚙️"
+    except Exception:
+        pass
+    out = [f"{emoji} {tool_name}"]
+    try:
+        from agent.display import get_tool_verb
+        verb = get_tool_verb(tool_name)
+        if verb:
+            out.append(f"{emoji} {verb}")
+    except Exception:
+        pass
+    return tuple(out)

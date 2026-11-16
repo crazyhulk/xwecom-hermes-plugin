@@ -26,7 +26,9 @@ print("adapter:", type(adapter).__name__, "| platform:", adapter.platform.value)
 for attr in ("SUPPORTS_MESSAGE_EDITING", "REQUIRES_EDIT_FINALIZE", "SUPPORTS_NATIVE_STREAMING"):
     print(f"  {attr} =", getattr(adapter, attr, None))
 print("  exec approval buttons:", type(adapter).supports_exec_approval_buttons())
-print("  hooks:", [h for h in ("pre_tool_call", "post_tool_call") if any("xwecom" in str(getattr(cb, "__module__", "")) for cb in mgr._hooks.get(h, []))])
+print("  hooks:", [h for h in ("pre_tool_call", "post_tool_call", "pre_api_request") if any("xwecom" in str(getattr(cb, "__module__", "")) for cb in mgr._hooks.get(h, []))])
+assert all(any("xwecom" in str(getattr(cb, "__module__", "")) for cb in mgr._hooks.get(h, []))
+           for h in ("pre_tool_call", "post_tool_call", "pre_api_request")), "a plugin hook is not registered"
 from gateway.display_config import _platform_defaults
 d = _platform_defaults("xwecom")
 print("  display defaults:", {k: d.get(k) for k in ("tool_progress", "streaming", "interim_assistant_messages")})

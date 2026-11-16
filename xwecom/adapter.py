@@ -167,6 +167,7 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
             self._start_ticker()
             hooks.attach(self)
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
+            asyncio.get_running_loop().create_task(self._flush_parked_rescues())  # replies a dead connection owed
             self._wire_plugin_handlers(None)  # ctx.register_platform_handler hooks
             return True
         except Exception as exc:  # the raw text may echo an env proxy's secret
@@ -179,6 +180,7 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
         self._running = False
         self._mark_disconnected()
         await self._stop_ticker()
+        await self._rescue_live_turns()  # live turns can't be finished on this connection: park their replies
         hooks.detach(self)
         for task in list(self._chat_workers.values()) + list(self._control_workers.values()):
             task.cancel()
@@ -265,6 +267,7 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
                     return
                 logger.warning("[%s] WebSocket error: %s", self.name, exc)
                 self._fail_all(RuntimeError("WeCom connection interrupted"))
+                await self._rescue_live_turns()  # old req_ids die with the socket: park unproven replies
                 await asyncio.sleep(RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)])
                 backoff_idx += 1
                 try:
@@ -272,6 +275,7 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
                     backoff_idx = 0
                     self._mark_connected()
                     logger.info("[%s] Reconnected", self.name)
+                    await self._flush_parked_rescues()
                 except Exception as reconnect_exc:
                     logger.warning("[%s] Reconnect failed: %s", self.name, reconnect_exc)
 
@@ -321,8 +325,8 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
             logger.debug("[%s] _dispatch_payload[ALL]: req_id=%s cmd=%r active_queues=%s", self.name, req_id or "(none)", cmd or "(empty)", list(self._reply_queues.keys()))
         if req_id and self._reply_queues.get(req_id):
             logger.debug(
-                "[%s] _dispatch_payload: req_id=%s cmd=%r has_pending_ack=%s errcode=%s in_NON_RESPONSE=%s payload_keys=%s", self.name, req_id, cmd,
-                self._reply_queues[req_id].pending_ack is not None, body_dict.get("errcode", "N/A") if body_dict is not None else "N/A", cmd in NON_RESPONSE_COMMANDS, list(payload.keys()),
+                "[%s] _dispatch_payload: req_id=%s cmd=%r waiting_acks=%s errcode=%s in_NON_RESPONSE=%s payload_keys=%s", self.name, req_id, cmd,
+                len(self._reply_queues[req_id].waiters), body_dict.get("errcode", "N/A") if body_dict is not None else "N/A", cmd in NON_RESPONSE_COMMANDS, list(payload.keys()),
             )
         # Reply-queue acks (inbound req_id, no/other cmd) MUST win over _pending_responses.
         if req_id and cmd not in NON_RESPONSE_COMMANDS:
@@ -372,9 +376,19 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
         return await self._request(cmd, self._new_req_id(cmd), body, timeout)
 
     async def _send_reply_request(self, reply_req_id: str, body: dict[str, Any], cmd: str = APP_CMD_RESPONSE, timeout: float = REQUEST_TIMEOUT_SECONDS) -> dict[str, Any]:
-        """Send a reply frame correlated to an inbound callback req_id."""
+        """Send a reply correlated to an inbound callback req_id (passive markdown, media, approval card) and
+        await its ack. WeCom acks every reply on a req_id with only that req_id, so it takes a slot in the same
+        per-req_id ack FIFO as the stream frames sharing the req_id (``streaming._dispatch_reply_frame``):
+        otherwise a stream frame's waiter could take this reply's ack and hide a real error on either."""
         self._require_ws()
-        return await self._request(cmd, self._require_reply_req_id(reply_req_id), body, timeout)
+        req_id = self._require_reply_req_id(reply_req_id)
+        if cmd != APP_CMD_RESPONSE:
+            return await self._request(cmd, req_id, body, timeout)  # not a reply frame: own correlation
+        frame = await self._dispatch_reply_frame(req_id, body, is_final=True)
+        try:
+            return await asyncio.wait_for(asyncio.shield(frame.future), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"no ack for reply on req_id={req_id}") from None
 
     @staticmethod
     def _require_reply_req_id(reply_req_id: str) -> str:
@@ -449,6 +463,7 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
             return
         source = self.build_source(chat_id=chat_id, chat_type="group" if is_group else "dm", user_id=sender_id or None, user_name=sender_id or None,
                                    message_id=msg_id)
+        self._remember_inbound_session(msg_id, source)  # turn_bubble: which session a busy ack belongs to
         event = MessageEvent(
             text=text, message_type=message_type, source=source, raw_message=payload, message_id=msg_id, media_urls=media_urls, media_types=media_types,
             reply_to_message_id=f"quote:{msg_id}" if has_reply_context else None, reply_to_text=reply_text if has_reply_context else None, timestamp=datetime.now(tz=UTC),
@@ -457,6 +472,7 @@ class WeComAdapter(EmulatedEditingMixin, StreamWireMixin, WeComMediaMixin, ChatS
         # trailing text callback merges instead of "interrupting" a run the attachment spawned.
         has_pending_batch = self._text_batch_key(event) in self._pending_text_batches
         is_attachment_only = bool(media_urls) and not (text or "").strip()
+        self._note_inbound(event)  # turn_bubble: the turn can open from this even with no lifecycle hook
         if (message_type == MessageType.TEXT and (self._text_batch_delay_seconds > 0 or has_pending_batch)) or (is_attachment_only and self._attachment_text_merge_delay_seconds > 0):
             self._enqueue_text_event(event)
         else:
@@ -845,8 +861,12 @@ def register(ctx) -> None:
         cron_deliver_env_var=gateway_env.HOME_ENV, standalone_sender_fn=_standalone_send,
         target_ref_syntax_fn=parse_nonempty, max_message_length=MAX_MESSAGE_LENGTH,
         platform_hint=_WECOM_PLATFORM_HINT,
-        # An editable surface: stream replies and show tool progress (each progress bubble is a live,
-        # editable WeCom stream with a running timer).
-        display_tier="high",
+        # One turn bubble per message (emulation.py): reply streams into it and its status area shows
+        # thinking / tools (fed by the plugin's own pre_api_request / pre|post_tool_call hooks, not by
+        # Hermes' tool-progress messages). "low" turns off what would otherwise be extra chatter —
+        # separate tool-progress / interim-commentary messages, the "⏳ Working" heartbeat, busy-ack
+        # detail — exactly like the built-in WeCom adapter; streaming stays on.
+        display_tier="low",
+        display_overrides={"streaming": True},
         **gateway_env.AUTHZ, **extra,
     )

@@ -310,6 +310,8 @@ class WeComMediaMixin:
                 await self._send_followup_markdown(chat_id, text, reply_to=reply_to)
             return SendResult(success=False, error=prepared["reject_reason"])
         reply_req_id = self._cached_reply_req_id(chat_id, reply_to)
+        # A turn bubble whose reply is complete has nothing left to stream: seal it so the media can reply.
+        await self._settle_turns_before_media(chat_id, reply_to)
         # An open stream bubble owns the req_id (passive replyMedia is never acked): go proactive.
         if self._book.open_messages(chat_id=chat_id):
             reply_req_id = None

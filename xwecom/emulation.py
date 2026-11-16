@@ -8,7 +8,11 @@ streams (``messages.MessageBook``):
   ``send`` is a finished bubble on the same reply when one is available, else a proactive markdown send.
 * ``edit_message(id, text, finalize=)`` re-renders that bubble (and rotates / continues it as needed).
 * ``on_processing_complete`` seals whatever the turn left open (an interrupted turn never finalizes).
-* the tool timer redraws an overlay — ``⠹ terminal 12s`` — under the live bubble of the chat that is
+* the *turn bubble* (``turn_bubble.py``): ``on_processing_start`` registers one bubble per inbound
+  message; it shows a status area (completed tools, running tools, "💭 Thinking (Ns)", short status
+  notices) from the first model call / tool / reply (or after a few seconds), and the turn's own reply
+  streams into it. Routing is conservative — see ``turn_bubble``. It closes in ``on_processing_complete``.
+* outside a turn bubble, the tool timer redraws an overlay — ``⠹ terminal 12s`` — under the live bubble of the chat that is
   running a tool, between Hermes' own edits (fed by ``pre_tool_call`` / ``post_tool_call`` hooks).
 * exec approvals render as a WeCom ``button_interaction`` template card; a click resolves the request
   through the published ``resolve_gateway_approval_card`` and updates the card in place.
@@ -28,6 +32,7 @@ from gateway.platforms.base import ExecApprovalPrompt, SendResult
 
 from .messages import MessageBook
 from .streaming import APP_CMD_RESPONSE_UPDATE
+from .turn_bubble import STREAM_CURSORS, TurnBubbleMixin
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +41,8 @@ TIMER_TICK_SECONDS = 1.0
 TIMER_SHOW_AFTER_SECONDS = 2.0  # quick tools never flash a timer
 ROTATION_CHECK_SECONDS = 15.0
 # Cursors Hermes appends to interim stream bodies (default " ▉"); stripped when the plugin seals a bubble
-# itself. A custom ``streaming.cursor`` is read from config at startup.
-_STREAM_CURSORS: tuple[str, ...] = (" ▉", "▉")
+# itself.
+_STREAM_CURSORS = STREAM_CURSORS
 
 
 @dataclass
@@ -56,7 +61,7 @@ def _fmt_elapsed(seconds: float) -> str:
     return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m{seconds % 60:02d}s"
 
 
-class EmulatedEditingMixin:
+class EmulatedEditingMixin(TurnBubbleMixin):
     """Needs from the adapter: ``_cached_reply_req_id``, ``_send_json``, ``_send_reply_request``,
     ``_send_markdown`` (non-stream fallback), ``name``, ``config``."""
 
@@ -69,6 +74,7 @@ class EmulatedEditingMixin:
         self._approval_cards: dict[str, dict[str, Any]] = {}  # task_id -> card state
         self._ticker_task: Optional[asyncio.Task] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._init_turns()
 
     # ── lifecycle ───────────────────────────────────────────────────────
     def _start_ticker(self) -> None:
@@ -90,12 +96,14 @@ class EmulatedEditingMixin:
         while True:
             await asyncio.sleep(TIMER_TICK_SECONDS)
             try:
-                await self._redraw_timers()
                 now = time.monotonic()
+                await self._tick_turns(now)
+                await self._redraw_timers()
                 if now - last_rotation_check >= ROTATION_CHECK_SECONDS:
                     last_rotation_check = now
                     await self._book.rotate_due()
                     self._book.forget_closed()
+                    self._forget_closed_turns(now)
             except Exception as exc:  # a tick must never kill the loop
                 logger.debug("[%s] ticker error: %s", self.name, exc)
 
@@ -108,6 +116,14 @@ class EmulatedEditingMixin:
         if not chat_id:
             return SendResult(success=False, error="chat_id is required")
         metadata = dict(metadata or {})
+        folded = await self._send_into_turn(chat_id, content, reply_to, metadata)
+        if folded is not None:
+            return folded
+        return await self._send_outside_turn(chat_id, content, reply_to, metadata)
+
+    async def _send_outside_turn(self, chat_id: str, content: str, reply_to: Optional[str],
+                                 metadata: dict[str, Any]) -> SendResult:
+        """The pre-turn path: its own bubble on the reply when a req_id is usable, else markdown."""
         expect_edits = bool(metadata.get("expect_edits"))
         req_id = None if metadata.get("force_proactive_send") else self._cached_reply_req_id(chat_id, reply_to or metadata.get("reply_to_message_id"))
         if req_id and (expect_edits or not metadata.get("is_approval_prompt")):
@@ -119,6 +135,8 @@ class EmulatedEditingMixin:
 
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
                            metadata: Optional[dict[str, Any]] = None) -> SendResult:
+        if message_id in self._turn_ids:
+            return await self._edit_turn_part(message_id, content, finalize=finalize)
         msg = self._book.get(message_id)
         if msg is None:
             return SendResult(success=False, error="unknown message (not an editable xwecom bubble)")
@@ -129,22 +147,39 @@ class EmulatedEditingMixin:
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         return False  # WeCom bots cannot recall a message
 
+    async def on_processing_start(self, event: Any) -> None:
+        logger.info("[%s] on_processing_start chat=%s msg=%s", self.name,
+                    getattr(getattr(event, "source", None), "chat_id", None), getattr(event, "message_id", None))
+        await self._start_turn(event)
+        parent = getattr(super(), "on_processing_start", None)
+        if parent is not None:
+            await parent(event)
+
     async def on_processing_complete(self, event: Any, outcome: Any) -> None:
-        """The turn is over: drop its tool timers and seal any bubble it left open."""
+        """The turn is over: close its turn bubble, drop its tool timers and seal any bubble it left open
+        (another session's live turn bubble in the same group keeps going)."""
         chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        live_turn_msgs = await self._complete_turns(event)
         self._activity.pop(chat_id, None)
         for msg in self._book.open_messages(chat_id=chat_id):
-            await self._book.close(msg, strip_suffixes=_STREAM_CURSORS)
+            if msg.message_id not in live_turn_msgs:
+                await self._book.close(msg, strip_suffixes=_STREAM_CURSORS)
         parent = getattr(super(), "on_processing_complete", None)
         if parent is not None:
             await parent(event, outcome)
 
     # ── tool timer ──────────────────────────────────────────────────────
-    def tool_started(self, chat_id: str, tool_call_id: str, tool_name: str) -> None:
-        if chat_id:
-            self._activity.setdefault(chat_id, _ChatActivity()).tools[tool_call_id or uuid.uuid4().hex] = _ToolRun(tool_name or "tool", time.monotonic())
+    def tool_started(self, chat_id: str, tool_call_id: str, tool_name: str, message_id: str = "",
+                     at: Optional[float] = None) -> None:
+        if not chat_id:
+            return
+        key, now = tool_call_id or uuid.uuid4().hex, at if at is not None else time.monotonic()
+        if not self._turn_tool_started(chat_id, key, tool_name, message_id, now):
+            self._activity.setdefault(chat_id, _ChatActivity()).tools[key] = _ToolRun(tool_name or "tool", now)
 
-    def tool_finished(self, chat_id: str, tool_call_id: str) -> None:
+    def tool_finished(self, chat_id: str, tool_call_id: str, message_id: str = "", at: Optional[float] = None) -> None:
+        if self._turn_tool_finished(chat_id, tool_call_id, message_id, at if at is not None else time.monotonic()):
+            return
         activity = self._activity.get(chat_id)
         if activity is not None:
             activity.tools.pop(tool_call_id, None)
@@ -162,8 +197,10 @@ class EmulatedEditingMixin:
         now = time.monotonic()
         for chat_id in list(self._activity):
             overlay = self._overlay_for(chat_id, now)
-            # Draw on the newest open bubble of the chat (the tool-progress bubble while tools run).
-            bubbles = self._book.open_messages(chat_id=chat_id)
+            # Draw on the newest open bubble of the chat (the tool-progress bubble while tools run); a turn
+            # bubble draws its own status area.
+            turn_msgs = {t.msg.message_id for t in self._turns.get(chat_id, ())}
+            bubbles = [m for m in self._book.open_messages(chat_id=chat_id) if m.message_id not in turn_msgs]
             if bubbles:
                 await self._book.set_overlay(bubbles[-1], overlay)
             if not overlay and not (self._activity.get(chat_id) and self._activity[chat_id].tools):

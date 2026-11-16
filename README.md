@@ -18,7 +18,7 @@ This plugin takes the opposite approach and emulates the missing capabilities at
 | a message that lives longer than 10 minutes | sealed at 9 min and continued in a fresh bubble, same id |
 | a message longer than one frame (20 KB) | spills over into further bubbles, no repeated text |
 | an edit after the message was closed | continues in a new bubble (WeCom would silently drop it) |
-| tool progress | an editable progress bubble with a live `⠹ terminal 37s` timer |
+| tool progress, thinking, status notices | one *turn bubble* per message: `💭 Thinking (Ns)`, `⠹ 🔍 Searching… (Ns)` above the answer, cleared when the reply text arrives |
 | exec approval buttons | a clickable `button_interaction` card, updated in place after a click |
 
 Measured against the live WeCom API (Nov 2026): several streams can be open at once on one inbound
@@ -69,10 +69,13 @@ gateway:
 ```
 xwecom/
 ├── adapter.py      # WebSocket connection, inbound parsing, access policy, register()
-├── emulation.py    # the editable-IM surface Hermes talks to (+ tool timer, approval cards)
+├── emulation.py    # the editable-IM surface Hermes talks to (send / edit / approval cards)
+├── turn_bubble.py  # one bubble per inbound message: lifecycle, send routing, rescue
+├── turn.py         # pure turn state: body segments, tools, thinking, notices, rendering rules
 ├── messages.py     # virtual message → chain of WeCom stream bubbles (rotation, spill, overlay)
-├── streaming.py    # one stream frame on the wire, ack tracking, coalescing, final-frame retry
-├── hooks.py        # pre/post_tool_call → tool timer of the right chat
+├── streaming.py    # one frame on the wire; per-req_id FIFO ack tracking (only finish frames wait)
+├── rescue.py       # undelivered replies parked across reconnects (per bot)
+├── hooks.py        # pre_tool_call / post_tool_call / pre_api_request → the right turn bubble
 ├── media.py        # inbound media decryption, outbound uploads
 ├── send_queue.py   # per-chat FIFO + 30 msgs/min token bucket
 ├── gateway_env.py  # env → config seeding (XWECOM_* with WECOM_* fallback)
@@ -82,8 +85,15 @@ xwecom/
 Only names listed in Hermes' published plugin API (`hermes_cli/data/plugin_api.json`) are imported
 directly; everything else goes through `compat.py`, which degrades instead of failing when core moves.
 
+The full design (turn bubble, send routing, ack model, rescue, known limits) is in
+[docs/implementation.md](docs/implementation.md).
+
 ## Tests
 
 ```bash
-python -m pytest tests          # emulation core against a fake WeCom that models the measured API
+python -m pytest tests          # unit tests against a fake WeCom that models the measured API
+# end-to-end, through Hermes' real plugin discovery / stream consumer / session-authority path:
+HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONPATH=/path/to/hermes-agent python tests/e2e/authority_e2e.py
 ```
+
+See [tests/e2e/README.md](tests/e2e/README.md) for the other e2e scripts.
