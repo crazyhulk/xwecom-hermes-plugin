@@ -55,7 +55,7 @@ from gateway.platforms.base import SendResult
 
 from . import rescue
 from .compat import core_send_lane, core_templates, source_session_key, tool_line_prefixes
-from .turn import BUSY_HEADS, BUSY_TAILS, STATUS_KEYS, Turn, busy_ack_pattern, matches_status, template_pattern
+from .turn import BUSY_HEADS, BUSY_TAILS, INTERNAL_HEADER, INTERNAL_HEADER_CONT, STATUS_KEYS, Turn, busy_ack_pattern, matches_status, template_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -164,9 +164,13 @@ class TurnBubbleMixin:
             logger.info("[%s] no internal turn bubble: no req_id for chat=%s", self.name, chat_id)
             return None
         now = self._now()
+        # The same background run reopening after its bubble sealed (late finalize, long compression) gets a
+        # second bubble marked as its continuation: the split is visible instead of looking like a new task.
+        resumed = bool(turn_id) and any(t.internal and t.closed and t.session == session and t.turn_id == turn_id
+                                        for t in self._turns.get(chat_id, ()))
         turn = Turn(chat_id=chat_id, opener_id=f"internal:{uuid.uuid4().hex[:12]}", session=session,
                     msg=self._book.register(chat_id, req_id), started=now, thinking_since=now, internal=True,
-                    turn_id=turn_id, last_activity=now)
+                    turn_id=turn_id, last_activity=now, header=INTERNAL_HEADER_CONT if resumed else INTERNAL_HEADER)
         self._turns.setdefault(chat_id, []).append(turn)
         logger.info("[%s] internal turn opened chat=%s req_id=%s session=%s turn_id=%s", self.name, chat_id, req_id,
                     session, turn_id)

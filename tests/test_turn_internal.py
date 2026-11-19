@@ -13,6 +13,7 @@ from test_messages import Clock, FakeWeCom, messages  # noqa: E402
 from test_turn_bubble import Host, _intake, run, send_progress_messages, settle, turn_bubble  # noqa: E402
 
 
+HDR = turn_bubble.INTERNAL_HEADER
 TID = "s1:task:aaaa"  # the injected turn's turn_id (core mints one per run_conversation)
 
 
@@ -55,7 +56,7 @@ def test_injected_internal_turn_renders_in_one_bubble():
         return h
     h = run(go())
     assert h.outside == [] and h.markdown == [], h.outside  # nothing took the old one-bubble-per-send path
-    assert h.wire.visible() == ["进程已完成。\n\n结果：一切正常。"], h.wire.visible()
+    assert h.wire.visible() == [HDR + "\n\n进程已完成。\n\n结果：一切正常。"], h.wire.visible()
     assert h.wire.finished == set(h.wire.order), "the internal turn's bubble must close without a lifecycle hook"
 
 
@@ -67,7 +68,7 @@ def test_internal_turn_shows_its_tools_before_text():
         await settle()
         return h
     h = run(go())
-    assert h.wire.visible() == ["⠋ 🔧 terminal (0s)"], h.wire.visible()
+    assert h.wire.visible() == [HDR + "\n⠋ 🔧 terminal (0s)"], h.wire.visible()
 
 
 def test_silent_internal_wake_draws_nothing():
@@ -219,7 +220,7 @@ def test_review_fork_during_a_settled_internal_turn_is_ignored_and_the_turn_sett
         return h
     h = run(go())
     assert all(t.closed for t in h._turns["u1"]), "the internal turn must settle, not wait 40 min"
-    assert h.wire.visible() == ["进程已完成。"] and h.wire.finished == set(h.wire.order)
+    assert h.wire.visible() == [HDR + "\n\n进程已完成。"] and h.wire.finished == set(h.wire.order)
     assert not any("memory" in v or "Thinking" in v for v in h.wire.visible())
 
 
@@ -278,7 +279,7 @@ def test_hand_over_closes_an_internal_turn_mid_stream():
     h, late = run(go())
     internal = next(t for t in h._turns["u1"] if t.internal)
     assert internal.closed and internal.closed_at == 1.0
-    assert h.wire.visible() == ["partial notice text", "USER ANSWER"] and h.wire.finished == set(h.wire.order)
+    assert h.wire.visible() == [HDR + "\n\npartial notice text", "USER ANSWER"] and h.wire.finished == set(h.wire.order)
     assert h.outside == [("u1", "CRON: daily")]
 
 
@@ -323,3 +324,42 @@ def test_status_lane_in_a_group_with_no_live_turn_keeps_its_own_message():
     h = run(go())
     assert [t.internal for t in h._turns["g"]] == [False, False]
     assert h.outside == [("g", "⚠️ fallback notice")] and "terminal" in h.wire.visible()[-1]
+
+
+def test_internal_turn_split_by_a_late_seal_continues_in_a_marked_second_bubble():
+    """The known race: the run's first bubble sealed (settled + 20s quiet) while the same background run was
+    still working. Its next marked model call opens a SECOND bubble marked as the continuation — the user's
+    turns are untouched and the split reads as one background task, not a new one."""
+    async def go():
+        h = Host(); _dm_seen(h)
+        h.llm_request_started("u1", "", at=0.0, session="u1", turn_id=TID, wake=True)
+        r = await h.send("u1", "第一段 ▉", metadata={"expect_edits": True})
+        await h._edit_turn_part(r.message_id, "第一段。", finalize=True)
+        h.clock.now = turn_bubble.SETTLED_IDLE_TIMEOUT + 1
+        await h._tick_turns(h.clock.now)
+        await settle()
+        h.llm_request_started("u1", "", at=h.clock.now, session="u1", turn_id=TID, wake=True)
+        r2 = await h.send("u1", "第二段 ▉", metadata={"expect_edits": True})
+        await h._edit_turn_part(r2.message_id, "第二段。", finalize=True)
+        h.clock.now += turn_bubble.SETTLED_IDLE_TIMEOUT + 1
+        await h._tick_turns(h.clock.now)
+        await settle()
+        return h
+    h = run(go())
+    assert h.outside == [] and h.markdown == [], h.outside
+    assert h.wire.visible() == [HDR + "\n\n第一段。", turn_bubble.INTERNAL_HEADER_CONT + "\n\n第二段。"], h.wire.visible()
+
+
+def test_a_new_background_run_after_a_closed_one_is_not_marked_as_continuation():
+    async def go():
+        h = Host(); _dm_seen(h)
+        for n, tid in enumerate((TID, "s1:task:bbbb")):
+            h.llm_request_started("u1", "", at=h.clock.now, session="u1", turn_id=tid, wake=True)
+            r = await h.send("u1", f"任务{n} ▉", metadata={"expect_edits": True})
+            await h._edit_turn_part(r.message_id, f"任务{n}。", finalize=True)
+            h.clock.now += turn_bubble.SETTLED_IDLE_TIMEOUT + 1
+            await h._tick_turns(h.clock.now)
+            await settle()
+        return h
+    h = run(go())
+    assert h.wire.visible() == [HDR + "\n\n任务0。", HDR + "\n\n任务1。"], h.wire.visible()

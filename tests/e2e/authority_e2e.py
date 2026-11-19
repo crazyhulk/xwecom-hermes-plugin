@@ -515,7 +515,7 @@ def check_internal_turn(wire, adapter):
     shown = real_bubbles(wire)
     assert shown[0] == "好的，已在后台运行。", shown
     rest = shown[1:]
-    assert rest == ["进程已完成。\n\n日志一切正常。"], f"the internal turn must be ONE bubble: {rest}"
+    assert rest == ["🔔 后台任务\n\n进程已完成。\n\n日志一切正常。"], f"the internal turn must be ONE bubble: {rest}"
     assert not wire.markdown, wire.markdown
     bubble = next(s for s in wire.order if "日志一切正常" in wire.screen[s])
     frames = [c.replace("\u200b", "") for _, c in wire.history[bubble]]

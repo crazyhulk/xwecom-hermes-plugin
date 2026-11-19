@@ -28,6 +28,8 @@ SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 COMPLETED_MAX = 5
 NOTICES_MAX = 3  # status lines shown at once (newest kept); older persistent ones still reach the tail
 SEGMENT_JOINER = "\n\n"
+INTERNAL_HEADER = "🔔 后台任务"  # tops an internal turn's bubble: it is not an answer to the user's last message
+INTERNAL_HEADER_CONT = "🔔 后台任务（续）"  # the same background run continuing after its first bubble sealed
 STATUS_RULE = "\n\n---\n"  # same rule messages.OVERLAY_RULE draws above the live status
 
 
@@ -120,6 +122,7 @@ class Turn:
     is_group: bool = False
     internal: bool = False  # a synthetic turn (no inbound message): drawn only once it has a tool or text
     turn_id: str = ""  # an internal turn: core's turn_id of the run that woke it
+    header: str = ""  # first line of the bubble (internal turns: INTERNAL_HEADER / INTERNAL_HEADER_CONT)
     aliases: set[str] = field(default_factory=set)  # inbound ids folded into this turn (busy acks)
     thinking: bool = True  # the model is working (cleared when reply text arrives)
     round: int = 0  # model calls seen (``pre_api_request``): text clears the tools of earlier ones
@@ -158,7 +161,9 @@ class Turn:
                 continue
             out += (glue if out else "") + segment
             glue = "" if index in self.glued else SEGMENT_JOINER
-        return out
+        # The header is part of the body (not the overlay) so it is sealed with the first bubble and every
+        # seal / confirmed offset counts it; before any text it is drawn atop the status instead.
+        return f"{self.header}{SEGMENT_JOINER}{out}" if out and self.header else out
 
     # ── events ──────────────────────────────────────────────────────────
     def touch(self, now: float) -> None:
@@ -299,6 +304,8 @@ class Turn:
         elif self.thinking and not self.tools and not self.internal:  # an internal turn never shows Thinking
             lines.append(f"{spin} 💭 Thinking ({int(now - self.thinking_since)}s)")
         lines += [n.text for n in list(self.notices.values())[-NOTICES_MAX:] if n.text]
+        if lines and self.header and not self.body():
+            lines.insert(0, self.header)
         return "\n".join(lines)
 
     def final_tail(self) -> str:
