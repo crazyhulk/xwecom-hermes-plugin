@@ -118,6 +118,8 @@ class Turn:
     thinking_since: float
     event: Any = None
     is_group: bool = False
+    internal: bool = False  # a synthetic turn (no inbound message): drawn only once it has a tool or text
+    turn_id: str = ""  # an internal turn: core's turn_id of the run that woke it
     aliases: set[str] = field(default_factory=set)  # inbound ids folded into this turn (busy acks)
     thinking: bool = True  # the model is working (cleared when reply text arrives)
     round: int = 0  # model calls seen (``pre_api_request``): text clears the tools of earlier ones
@@ -294,7 +296,7 @@ class Turn:
         running = [run for run in self.tools.values() if not run.cleared]
         if running:
             lines += [f"{spin} {run.running} ({int(now - run.started)}s)" for run in running]
-        elif self.thinking and not self.tools:
+        elif self.thinking and not self.tools and not self.internal:  # an internal turn never shows Thinking
             lines.append(f"{spin} 💭 Thinking ({int(now - self.thinking_since)}s)")
         lines += [n.text for n in list(self.notices.values())[-NOTICES_MAX:] if n.text]
         return "\n".join(lines)

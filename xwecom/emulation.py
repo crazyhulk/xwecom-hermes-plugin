@@ -140,7 +140,10 @@ class EmulatedEditingMixin(TurnBubbleMixin):
         msg = self._book.get(message_id)
         if msg is None:
             return SendResult(success=False, error="unknown message (not an editable xwecom bubble)")
-        if not await self._book.update(msg, content, finalize=finalize):
+        # The progress lane rewrites its whole line list: an edit continuing a closed bubble starts at the
+        # changed line, never at a bare suffix like "(×2)".
+        whole_lines = self._send_lane() == "progress"
+        if not await self._book.update(msg, content, finalize=finalize, whole_lines=whole_lines):
             return SendResult(success=False, error="WeCom stream unavailable")
         return SendResult(success=True, message_id=message_id)
 
@@ -170,11 +173,11 @@ class EmulatedEditingMixin(TurnBubbleMixin):
 
     # ── tool timer ──────────────────────────────────────────────────────
     def tool_started(self, chat_id: str, tool_call_id: str, tool_name: str, message_id: str = "",
-                     at: Optional[float] = None) -> None:
+                     at: Optional[float] = None, session: str = "", turn_id: str = "") -> None:
         if not chat_id:
             return
         key, now = tool_call_id or uuid.uuid4().hex, at if at is not None else time.monotonic()
-        if not self._turn_tool_started(chat_id, key, tool_name, message_id, now):
+        if not self._turn_tool_started(chat_id, key, tool_name, message_id, now, session=session, turn_id=turn_id):
             self._activity.setdefault(chat_id, _ChatActivity()).tools[key] = _ToolRun(tool_name or "tool", now)
 
     def tool_finished(self, chat_id: str, tool_call_id: str, message_id: str = "", at: Optional[float] = None) -> None:

@@ -166,6 +166,17 @@ _PROGRESS_LANE = "send_progress_messages"
 _STATUS_LANE = "_send_or_update_status_coro"
 
 
+def is_internal_wake(user_message: Any) -> bool:
+    """True when a model call's ``user_message`` is a gateway-injected internal notification: core appends
+    ``INTERNAL_NOTIFICATION_FOOTER`` to it (``gateway/run_notifications.py::_mark_internal_notification``).
+    Core-private; when it moves this answers False, so no internal turn opens (the old path)."""
+    try:
+        from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER as footer
+    except Exception:
+        return False
+    return bool(footer) and isinstance(user_message, str) and footer in user_message
+
+
 def core_send_lane() -> str:
     """"progress" | "status" | "" — which core status lane the current adapter call comes from."""
     try:

@@ -139,8 +139,9 @@ class SlowModelAgent:
         from hermes_cli.lifecycle import invoke_hook
         if self.tool_progress_callback:
             self.tool_progress_callback("llm.request_started", "_thinking_timer", f"stub (API call #{n})", None)
-        invoke_hook("pre_api_request", task_id=self.session_id, turn_id="t", api_request_id=f"t:api:{n}",
-                    session_id=self.session_id, user_message="", conversation_history=[], platform="xwecom",
+        invoke_hook("pre_api_request", task_id=self.session_id, turn_id=getattr(self, "_turn_id", "t"),
+                    api_request_id=f"t:api:{n}", session_id=self.session_id,
+                    user_message=getattr(self, "_user_message", ""), conversation_history=[], platform="xwecom",
                     model=self.model, provider=self.provider, base_url="", api_mode="chat", api_call_count=n,
                     retry_count=0, request_messages=[], system_prompt="", message_count=1, tool_count=0,
                     approx_input_tokens=1, request_char_count=1, max_tokens=1000, started_at=time.time(),
@@ -151,7 +152,8 @@ class SlowModelAgent:
         if self.tool_progress_callback:
             self.tool_progress_callback("tool.started", name, preview, args, tool_call_id=call_id)
         _dispatch_pre_tool_call_hooks(name, args, middleware_trace=[], task_id=self.session_id,
-                                      session_id=self.session_id, tool_call_id=call_id, turn_id="t",
+                                      session_id=self.session_id, tool_call_id=call_id,
+                                      turn_id=getattr(self, "_turn_id", "t"),
                                       api_request_id="t:api:1", conversation_id="")
 
     def _tool_done(self, name, call_id, args, seconds):
@@ -364,6 +366,171 @@ def check_two_rounds(wire):
     assert all(s in wire.finished for s in wire.order), "a bubble was left open"
 
 
+class QuickAgent(SlowModelAgent):
+    def run_conversation(self, message, **kwargs):
+        self._api_call(1)
+        time.sleep(0.5)
+        if self.stream_delta_callback:
+            self.stream_delta_callback("好的，已在后台运行。")
+        return {"final_response": "好的，已在后台运行。", "messages": [{"role": "user", "content": message},
+                {"role": "assistant", "content": "好的，已在后台运行。"}], "api_calls": 1, "completed": True}
+
+
+class InternalAgent(TwoRoundAgent):
+    def _start_review_fork(self):
+        import contextvars
+        import threading
+        ctx = contextvars.copy_context()  # propagate_context_to_thread
+        # once while the turn is still settling, once after it closed
+        threading.Thread(target=ctx.run, args=(_review_fork_run, self, (0.3, 6.0)), daemon=True).start()
+
+
+    """The live 02:46 turn: a background-process completion woke the session. The same ssh twice (core's
+    progress lane collapses it to "(×2)"), text, a tool boundary, another tool, text."""
+
+    def run_conversation(self, message, **kwargs):
+        assert "Background process" in message or "proc_" in message, message[:200]
+        # What core's agent passes as pre_api_request(user_message=...): the persisted form of the message
+        # (gateway/run_turn_prepare.py strips timestamps only), carrying core's internal-notification footer.
+        self._user_message = kwargs.get("persist_user_message") or message
+        from gateway.run_notifications import INTERNAL_NOTIFICATION_FOOTER
+        assert INTERNAL_NOTIFICATION_FOOTER in self._user_message, "core no longer marks the wake"
+        self._turn_id = f"{self.session_id}:internal:{id(self):x}"
+        self._api_call(1)
+        time.sleep(1.2)
+        ssh = {"command": "ssh box uptime"}
+        for call in ("call_s1", "call_s2"):
+            self._tool("terminal", call, ssh, "ssh box uptime")
+            time.sleep(1.0)
+            self._tool_done("terminal", call, ssh, 1.0)
+        self._api_call(2)
+        time.sleep(1.2)
+        self._say(["进程", "已完成。"])
+        if self.stream_delta_callback:
+            self.stream_delta_callback(None)
+        args = {"command": "tail -n 5 log"}
+        self._tool("terminal", "call_t", args, "tail -n 5 log")
+        time.sleep(1.6)
+        self._tool_done("terminal", "call_t", args, 1.6)
+        self._api_call(3)
+        time.sleep(1.0)
+        self._say(["日志", "一切正常。"])
+        self._start_review_fork()
+        answer = "日志一切正常。"
+        return {"final_response": answer, "messages": [{"role": "user", "content": message},
+                                                       {"role": "assistant", "content": answer}],
+                "api_calls": 3, "completed": True}
+
+
+def _review_fork_run(agent, delays):
+    """The background review fork (run_agent: ``propagate_context_to_thread``): the turn's session context
+    (message id "", session key), its OWN turn_id, a review prompt; model call, memory tool, model call."""
+    from hermes_cli.lifecycle import invoke_hook
+    from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
+    for n, delay in enumerate(delays):
+        time.sleep(delay)
+        invoke_hook("pre_api_request", task_id="rv", turn_id=f"review:{n}", api_request_id=f"rv:{n}",
+                    session_id=agent.session_id, user_message="Review the conversation above …",
+                    conversation_history=[], platform="xwecom", model="m", provider="p", base_url="", api_mode="chat",
+                    api_call_count=1, retry_count=0, request_messages=[], system_prompt="", message_count=1,
+                    tool_count=0, approx_input_tokens=1, request_char_count=1, max_tokens=1, started_at=time.time(),
+                    middleware_trace=[], request={})
+        _dispatch_pre_tool_call_hooks("memory", {}, middleware_trace=[], task_id="rv", session_id=agent.session_id,
+                                      tool_call_id=f"rv_call_{n}", turn_id=f"review:{n}", api_request_id="rv",
+                                      conversation_id="")
+        time.sleep(0.5)
+        invoke_hook("post_tool_call", tool_name="memory", args={}, result="ok", task_id="rv",
+                    session_id=agent.session_id, tool_call_id=f"rv_call_{n}", turn_id=f"review:{n}",
+                    api_request_id="rv", conversation_id="", duration_ms=500, status="ok", error_type=None,
+                    error_message=None, middleware_trace=[])
+
+
+async def internal_turn(name, user):
+    """A user turn, then core's watch-notification injection (``_inject_watch_notification`` →
+    ``admit_process_notice`` on the authority path) of an ``internal`` event with no message id."""
+    wire = Wire()
+    agents = iter([QuickAgent, InternalAgent])
+    GatewaySessionAgentMixin._build_fresh_agent = lambda self, *a, **k: next(agents)(self._ctx.session_id)
+    runner = GatewayRunner(load_gateway_config_for_runner())
+    adapter = platform_registry.create_adapter("xwecom", PlatformConfig(enabled=True, extra={
+        "bot_id": "bot", "secret": "sec", "dm_policy": "open"}))
+
+    class _WS:
+        closed = False
+
+        async def send_json(self, payload):
+            asyncio.get_running_loop().create_task(wire.handle(adapter, payload))
+
+    adapter._ws, adapter._running = _WS(), True
+    adapter.gateway_runner = runner
+    runner.adapters = {adapter.platform: adapter}
+    from gateway.session_authority import initialize_session_authority
+    await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    runner._wire_adapter_handlers(adapter)
+    adapter._start_ticker()
+    hooks = __import__(type(adapter).__module__.rsplit(".", 1)[0] + ".hooks", fromlist=["attach"])
+    hooks.attach(adapter)
+    key = f"agent:main:xwecom:dm:{user}"
+    sent_at = time.monotonic() - wire.t0
+    await adapter._dispatch_payload({"cmd": "aibot_msg_callback", "headers": {"req_id": f"REQ-{user}"}, "body": {
+        "msgid": f"{user}-1", "chattype": "single", "from": {"userid": user}, "msgtype": "text",
+        "text": {"content": "在后台跑一下 ssh 检查"}}})
+
+    async def idle(limit):
+        for _ in range(limit):
+            await asyncio.sleep(0.1)
+            turns = [t for ts in adapter._turns.values() for t in ts]
+            if turns and all(t.closed for t in turns) and not runner._is_session_running(key):
+                return
+    await idle(200)
+    user_frames = sum(len(v) for v in wire.history.values())
+    evt = {"type": "watch_match", "event_id": f"evt-{user}", "session_id": "proc_4c7ecc8277d9", "session_key": key,
+           "platform": "xwecom", "chat_type": "dm", "chat_id": user, "pattern": "done", "output": "done",
+           # the process's owning conversation, as the process registry records it at spawn
+           "parent_session_id": runner.session_store.lookup_by_session_key(key).session_id}
+    text = "[IMPORTANT: Background process proc_4c7ecc8277d9 completed normally (exit code 0)]\ndone"
+    accepted = await runner._inject_watch_notification(text, evt)
+    assert accepted, f"core did not accept the injected notification: {accepted!r}"
+    await asyncio.sleep(1.0)
+    for _ in range(600):  # the internal turn has no lifecycle close: it settles on its own
+        await asyncio.sleep(0.1)
+        internal = [t for ts in adapter._turns.values() for t in ts if getattr(t, "internal", False)]
+        if (internal or len(wire.order) > 2) and all(t.closed for t in internal) and not runner._is_session_running(key):
+            break
+    await asyncio.sleep(8.0)  # the review fork's second round lands after the close
+    await adapter._stop_ticker()
+    hooks.detach(adapter)
+    print(f"── {name}")
+    for sid in wire.order:
+        frames = wire.history[sid]
+        print(f"   bubble {sid[-6:]}: {len(frames)} frames, finished={sid in wire.finished}")
+        for ts, content in frames:
+            print(f"      +{ts - sent_at:5.1f}s {content!r}")
+    for m in wire.markdown:
+        print(f"   [md] {m!r}")
+    return wire, adapter, user_frames
+
+
+def check_internal_turn(wire, adapter):
+    shown = real_bubbles(wire)
+    assert shown[0] == "好的，已在后台运行。", shown
+    rest = shown[1:]
+    assert rest == ["进程已完成。\n\n日志一切正常。"], f"the internal turn must be ONE bubble: {rest}"
+    assert not wire.markdown, wire.markdown
+    bubble = next(s for s in wire.order if "日志一切正常" in wire.screen[s])
+    frames = [c.replace("\u200b", "") for _, c in wire.history[bubble]]
+    assert any("ssh box uptime" in c for c in frames), f"the internal turn's tool lines show: {frames}"
+    assert not any(c.strip().startswith("(×") for c in frames), "a bare (×2) fragment"
+    assert not frames[0].startswith(("⠋ 💭", "<think>")), f"no thinking placeholder before a tool or text: {frames[0]!r}"
+    assert all(s in wire.finished for s in wire.order), "a bubble was left open"
+    assert not any("Thinking" in c or "memory" in c for c in frames), f"review fork / thinking in the bubble: {frames}"
+    assert not any(not t.closed for ts in adapter._turns.values() for t in ts), "a turn is still live (spinning)"
+    internal = [t for ts in adapter._turns.values() for t in ts if getattr(t, "internal", False)]
+    users = [t for ts in adapter._turns.values() for t in ts if not getattr(t, "internal", False)]
+    assert len(internal) == 1 and internal[0].session == users[0].session, \
+        f"the hook session key must match the user turn's: {[t.session for t in internal + users]}"
+
+
 async def busy_turns(name, mode, user):
     """m1 runs; m2 arrives through the REAL WeCom intake while m1 is busy; core's busy path handles it in
     *mode* (interrupt → redirect, queue → a queued follow-up). Returns the wire."""
@@ -401,7 +568,8 @@ async def busy_turns(name, mode, user):
     for _ in range(300):
         await asyncio.sleep(0.1)
         turns = [t for ts in adapter._turns.values() for t in ts]
-        if len(turns) >= 1 and all(t.closed for t in turns) and not runner._is_session_running(key) \
+        # queue mode: the follow-up's turn starts ~0.1s after the first closes; wait for both
+        if len(turns) >= (2 if mode == "queue" else 1) and all(t.closed for t in turns) and not runner._is_session_running(key) \
                 and not runner._pending_messages.get(key) if hasattr(runner, "_pending_messages") else True:
             if all(t.closed for t in turns) and not runner._is_session_running(key):
                 break
@@ -443,6 +611,11 @@ async def main():
     two = Wire()
     await run_turn("two tool rounds around text", two, msgid="m7", user="u7", agent_cls=TwoRoundAgent)
     check_two_rounds(two)
+
+    # The live 02:46 bug: a background-process completion injected as an internal turn (no message id,
+    # authority path, no adapter lifecycle) must render in ONE bubble, like a user turn.
+    wire, adapter, _ = await internal_turn("injected internal turn (watch notification)", "u8")
+    check_internal_turn(wire, adapter)
 
     # F1 redirect: the second message redirects the running turn; ONE bubble, the ack transient.
     wire = await busy_turns("busy: second message redirects the running turn", "interrupt", "u3")

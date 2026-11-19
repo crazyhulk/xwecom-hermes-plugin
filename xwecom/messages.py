@@ -152,15 +152,17 @@ class MessageBook:
             return None
         return msg
 
-    async def update(self, msg: VirtualMessage, body: str, *, finalize: bool, overlay: Optional[str] = None) -> bool:
-        """Replace the body (and, when given, the overlay in the same frame)."""
+    async def update(self, msg: VirtualMessage, body: str, *, finalize: bool, overlay: Optional[str] = None,
+                     whole_lines: bool = False) -> bool:
+        """Replace the body (and, when given, the overlay in the same frame). ``whole_lines``: the body is a
+        rewritten line list (tool progress) — continuing a closed chain starts at the first changed line."""
         async with msg.lock:
             msg.body = body
             if overlay is not None:
                 msg.overlay = overlay
             if finalize:
                 msg.overlay = ""
-            ok = await self._render(msg, finish=finalize)
+            ok = await self._render(msg, finish=finalize, whole_lines=whole_lines)
             if ok and finalize:
                 msg.finalized = True
             return ok
@@ -220,13 +222,16 @@ class MessageBook:
                 del self._messages[mid]
 
     # ── rendering ───────────────────────────────────────────────────────
-    async def _render(self, msg: VirtualMessage, *, finish: bool, final_overlay: str = "") -> bool:
+    async def _render(self, msg: VirtualMessage, *, finish: bool, final_overlay: str = "",
+                      whole_lines: bool = False) -> bool:
         live = msg.live
         if live is None:
             start = min(msg.sealed_upto, len(msg.body))
             known = msg.sealed_text[:start]
             if len(known) == start and msg.body[:start] != known:
                 start = 0  # the edit rewrote text that is already sealed: show the new text whole
+            elif whole_lines and 0 < start < len(msg.body):
+                start = start + 1 if msg.body[start] == "\n" else msg.body.rfind("\n", 0, start) + 1
         # KNOWN GAP (pre-existing, not handled): this check covers a CLOSED chain only. While a chain is
         # still open, a body whose prefix changed under a bubble that was already sealed by spill
         # (``cut_point``) or by rotation (``_rotate``) is rendered from ``live.offset`` on — the sealed

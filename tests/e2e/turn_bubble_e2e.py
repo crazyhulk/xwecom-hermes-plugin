@@ -5,7 +5,7 @@ runs on_processing_start / on_processing_complete around a turn that is driven w
 REAL ``_interim_metadata`` heartbeat, the REAL busy-path ``_send_busy_reply`` and the REAL
 GatewayStreamConsumer — against a fake WeCom server that renders what the user would see.
 
-Reproduces the live bug of docs/turn-bubble-spec.md (blank wait, then separate bubbles for the redirect
+Reproduces the live bug of docs/implementation.md §5 (blank wait, then separate bubbles for the redirect
 notice, the heartbeat and the answer) and asserts the fix: one bubble per turn.
 """
 from __future__ import annotations
@@ -580,6 +580,29 @@ async def late_edit_and_rotation_scenario():
     assert_all_closed_and_clean(server)
 
 
+async def progress_edit_after_close_scenario():
+    """No live turn takes a progress-lane message anchored on a turn that already closed, so it keeps the
+    old path. Its next edit continues the finished bubble: with the whole changed line, never a bare
+    " (×2)" fragment."""
+
+    async def turn(adapter, event, server):
+        await stream_answer(adapter, ["好的。"])
+
+    server, adapter = await run_turn("progress edit after the turn closed", turn)
+    adapter._start_ticker()
+
+    async def send_progress_messages():  # core's lane, identified by this coroutine name
+        res = await adapter.send("user1", "💻 Running ssh box uptime", reply_to="m1")
+        await adapter.edit_message("user1", res.message_id, "💻 Running ssh box uptime (×2)")
+    await asyncio.get_running_loop().create_task(send_progress_messages())
+    await asyncio.sleep(0.3)
+    await adapter._stop_ticker()
+    show("… then the lane's edit", server)
+    shown = server.visible()
+    assert not any(v.lstrip().startswith("(×") for v in shown), shown
+    assert shown[-1] == "💻 Running ssh box uptime (×2)", shown
+
+
 async def main():
     await live_bug_scenario()
     await forced_status_line_scenario()
@@ -596,6 +619,7 @@ async def main():
     await media_from_other_session_scenario()
     await failed_finalize_scenario()
     await late_edit_and_rotation_scenario()
+    await progress_edit_after_close_scenario()
     print("\nALL TURN-BUBBLE E2E CHECKS PASSED")
 
 

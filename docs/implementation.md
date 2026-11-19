@@ -56,6 +56,7 @@ xwecom/
 - **10 分钟换泡**：气泡活到 540 秒时，由 ticker 封口（加 `⏬`），再接一个新气泡。对 Hermes 来说还是同一个 id。
 - **超长分泡**：正文超过约 19000 字节时，封掉满的部分，接着在新气泡里写。
 - **关闭后再编辑**：在新气泡里继续，不会被企微静默丢弃。如果改动了已封口的文字，新气泡显示完整的新文本。
+  - 工具进度通道的编辑（整份行列表重写）从**改动所在行的行首**接着写，不会出现只有「 (×2)」的碎片气泡（`update(..., whole_lines=True)`）。
 - **overlay**：状态区以 overlay 的形式画在正文下方（`\n\n---\n` 分隔），**永远不会被封进旧气泡**。
 
 ## 5. 本轮气泡（turn_bubble.py + turn.py）
@@ -67,13 +68,14 @@ xwecom/
 - 第一次 `pre_api_request` / `pre_tool_call`；
 - 该轮第一条带标记（`notify` 或 `expect_edits`）的回复。
 
-例外：`reply_expected is False` 或内部唤醒的消息不开气泡。没有画任何东西的轮次不发帧，不会留下空气泡或「✅」。
+例外：`reply_expected is False` 的消息不开气泡；内部唤醒不经过上述入口——后台进程完成 / watch 通知按 §5.4 的规则开自己的气泡，其它内部唤醒（goal、kanban、heartbeat 等）保持原路径。没有画任何东西的轮次不发帧，不会留下空气泡或「✅」。
 
 **换手**：只有 `on_processing_start`（同一会话的后续消息真正开始）会冻结或关闭上一轮：
 - 已送达答案或什么都没画 → 立即关闭；
-- 正在输出答案 → 冻结到它自己的 `on_processing_complete`。
+- 正在输出答案 → 冻结到它自己的 `on_processing_complete`；
+- 内部轮次（§5.4）没有 `on_processing_complete` → 一律立即关闭。
 
-由回复或 hook 触发的兜底打开**永远不会**关闭别的轮次。
+由回复或 hook 触发的兜底打开**永远不会**关闭别的用户轮次；同一会话的内部轮次例外，会被立即换手关闭。
 
 **关闭**：任一条件触发即关闭。
 - `on_processing_complete`；
@@ -89,7 +91,7 @@ xwecom/
 ```
 ✓ 已完成的工具（最多 5 个）
 ⠹ 运行中的工具 (Ns)               ← 标签优先用 Hermes 工具进度行的文字，如「🔍 Searching the web for X」
-⠹ 💭 Thinking (Ns)               ← 没有运行中工具时显示，计时从最近一次 pre_api_request 起，不显示模型名
+⠹ 💭 Thinking (Ns)               ← 没有运行中工具时显示，计时从最近一次 pre_api_request 起，不显示模型名；内部轮次从不显示
 状态通知（最多 3 条）              ← 心跳、忙碌提示、Hindsight 等
 ```
 
@@ -112,6 +114,7 @@ xwecom/
 | 心跳、卡住警告、审批超时、排空通知 | `_interim_send` 且文本完整匹配 core 对应 i18n 模板（字段按类型约束，如分钟数只能是数字） | 临时状态行 |
 | 忙碌提示（↪ Redirected / ⏳ Queued / steer / interrupt） | 未标记、锚定在同一会话的新入站消息上，且文本匹配忙碌提示模板 | 临时状态行，同时把新消息并入本轮（重定向后的答案落在同一气泡） |
 | 其他 `_interim_send`（澄清前的说明、审批卡前的完整命令、插件推送、答案尾巴） | — | 单独消息，不会被丢 |
+| 内部轮次的正文（无锚定，带 `expect_edits` / `notify`，未标 `_interim_send`） | 本聊天唯一的活轮次是内部轮次 | 正文分段（只并入，从不打开轮次） |
 | 审批提示、`force_proactive_send`、无锚定（cron / send_message）、锚定在其他会话或未知消息、锚定在别处的带标记 send（忙时的 `/status`） | — | 单独消息 |
 
 **工具进度行与工具的匹配**（F2）：
@@ -123,6 +126,20 @@ xwecom/
 **群聊**：
 - 入站时记录每条消息 → 会话键（`compat.source_session_key`，群聊里按发送者区分）。
 - 同一群里有多个会话的轮次同时进行时，不猜，无锚定的 send 走单独消息。
+
+### 5.4 内部轮次（后台进程完成等）
+
+core 把后台进程完成通知注入成 `MessageEvent(internal=True)`，没有 message id，走会话权威通道（`session_automation.admit_process_notice`），**不经过适配器生命周期**：没有 `on_processing_start` / `on_processing_complete`，hook 的 `HERMES_SESSION_MESSAGE_ID` 为空，所有 send 都无锚定。以前每个 send 各成一泡，进度编辑还会冒出「 (×2)」碎片（xwtest 2026-11-19 02:46）。现在：
+
+- **打开**：只由一次 `pre_api_request` 打开，且其 `user_message` 带 core 的内部通知标记（`INTERNAL_NOTIFICATION_FOOTER`，`compat.is_internal_wake`）、message id 为空、该会话（hook 的 `HERMES_SESSION_KEY`）没有活轮次。气泡挂在本聊天缓存的最新 req_id 上；没有 req_id（如群里启动后没人说过话）→ 不开，走旧路径。
+- **从不打开**：工具 hook、不带标记的模型调用（后台复盘 fork、子代理自动续跑，它们同样是空 message id + 同一会话键）、状态 / 进度通道（它们在没有会话上下文的协程里跑）、无锚定的正文（cron 用同样的标记无锚定投递）。
+- **并入**：hook、状态 / 进度通道、无锚定正文都只并入已存在的内部轮次。正文定稿后，`turn_id` 与打开者不同的 hook（复盘 fork）一律忽略，不会重启轮次。
+- **显示**：没有工具行或正文之前什么都不画（静默唤醒不可见）；**从不显示 💭 Thinking**。
+- **关闭**：正文定稿后安静 20 秒，或最终回复后 3 秒；一直没画过东西的，最后一次事件后 `UNDRAWN_INTERNAL_IDLE`（60 秒）关闭，收集到的通知按旧路径单独发出；同一会话的任何新用户轮次（生命周期或兜底打开）立即换手关闭它；断线时同 §7。它从不关闭或换手用户轮次。
+- **复盘摘要**（「💾 Self-improvement review …」）：轮次关闭后才到（通常晚一分钟以上），保持单独消息——已封口的气泡企微不会再渲染，折成临时行会丢信息。
+- **覆盖范围**：只有带这个标记的唤醒会开内部轮次——后台进程完成 / watch 匹配通知（`run_notifications._mark_internal_notification`，以及 `session_automation` 合并后的批量通知）。goal 续跑、kanban 唤醒、heartbeat、插件注入、session_bot 等唤醒不带标记，保持原路径（每个 send 各自一条），不会更差但也不合并。
+- **已知竞态**：内部轮次的分段定稿可能晚于下一次模型调用到达，此时若这次调用超过 20 秒且没有工具，气泡会提前封口，后续正文接到新气泡（不丢内容；下一个带标记的调用会重新开轮次）。
+- **注意（cron 合并）**：内部轮次活着期间，发到同一聊天、无锚定且带 `notify` 的 cron / `send_message` 投递会被并入该气泡——与它自己的正文无法区分。
 
 ## 6. 发送与 ACK（streaming.py）
 
@@ -176,12 +193,15 @@ xwecom/
 | `agent.i18n.t` 的状态/忙碌模板 | 识别心跳、忙碌提示 | 回退到本地英文副本；仍不匹配则单独成泡 |
 | `BasePlatformAdapter._source_session_key` | 群聊按发送者区分会话 | 回退为 `chat` / `chat:user` |
 | `agent.display.get_tool_verb` | 工具进度行的动作词前缀 | 动作词形式的行不作标签，工具保留默认标签 |
+| `gateway.run_notifications.INTERNAL_NOTIFICATION_FOOTER` | 识别内部唤醒（§5.4） | 不再打开内部轮次，回到每个 send 单独成泡 |
+
+hook 里的会话键、message id、聊天经由公开的 `gateway.session_context.get_session_env` 读取；`turn_id` / `user_message` 是 `pre_api_request` / `pre_tool_call` hook 的公开参数。
 
 ## 11. 测试
 
 ```bash
 PY=<hermes test-environment python>
-cd ~/xwecom-hermes-plugin && $PY -m pytest -q tests                 # 96 个单元测试
+cd ~/xwecom-hermes-plugin && $PY -m pytest -q tests                 # 114 个单元测试
 for f in load_check consumer_e2e hooks_approval_e2e turn_bubble_e2e turn_bubble_zh_e2e authority_e2e; do
   HERMES_DISABLE_LAZY_INSTALLS=1 PYTHONPATH=~/.hermes/hermes-agent $PY tests/e2e/$f.py
 done
@@ -194,13 +214,16 @@ done
   - 重定向和排队；
   - 结束帧被 846609 拒绝时补发；
   - 断线重连后补发；
-  - 两轮工具与正文交替。
+  - 两轮工具与正文交替；
+  - 注入的内部轮次（`_inject_watch_notification` → `admit_process_notice`）：一个气泡、无 Thinking、无「(×2)」碎片，期间与关闭后的复盘 fork hook 都被忽略。
+- **`tests/test_turn_internal.py`**：内部轮次的打开 / 并入 / 关闭、复盘 fork、换手、群聊会话隔离、cron 不被吞。
 - **`turn_bubble_zh_e2e.py`**：中文界面下的状态模板匹配。
 - **`HERMES_DISABLE_LAZY_INSTALLS=1`**：必需，否则 core 会为临时 `HERMES_HOME` 重新拉起运行时，测试挂住。
 
 ## 12. 已知限制 / 待办
 
 - **H1**：快速工具前的一句短开场白如果晚到，可能触发 3 秒封泡，答案接到第二个气泡（不丢内容）。
+- **内部轮次**：正文定稿后若 core 超过 20 秒才有下一个 hook（如长时间压缩），气泡会提前封口，后续内容接到新气泡；首个模型调用超过 60 秒且尚未画出任何东西时同理（下一次带标记的模型调用会重新打开）。另见 §5.4 的 cron 合并。
 - **H3**：群聊里断线暂存的回复，重连后可能因为没有可用的被动回复上下文而发不出去，会一直留在暂存里（上限 50 条）。
 - **ACK 顺序**：并发下企微是否严格按发送顺序回 ACK 未验证；即使乱序，也只影响送达判断。
 - **同名工具并行**：同一条进度消息里两个同名工具按开始顺序贴标签，并行时预览可能互换。

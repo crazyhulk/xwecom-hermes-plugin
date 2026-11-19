@@ -54,7 +54,10 @@ async def tool_timer():
     assert res.success, res
 
     # The agent runs the tool on a worker thread that copied the turn's context (session env bound).
-    tokens = [session_context._SESSION_PLATFORM.set("xwecom"), session_context._SESSION_CHAT_ID.set("user1")]
+    # It names an inbound message that has no turn bubble, so the legacy overlay timer draws (a hook with NO
+    # message id is an internal turn's and opens its own turn bubble — tests/test_turn_internal.py).
+    tokens = [session_context._SESSION_PLATFORM.set("xwecom"), session_context._SESSION_CHAT_ID.set("user1"),
+              session_context._SESSION_MESSAGE_ID.set("m-without-turn")]
     ctx = contextvars.copy_context()
 
     def run_tool():
